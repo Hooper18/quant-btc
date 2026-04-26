@@ -60,7 +60,7 @@ def _scan_files(symbol_dir: Path) -> list[Path]:
 
 
 def _classify(name: str) -> tuple[str, tuple[int, int] | None]:
-    """文件名 → (type, (year, month) or None)。type ∈ ohlcv_TF / oi / funding / fng / other"""
+    """文件名 → (type, (year, month) or None)。"""
     m = re.match(r"^(1m|5m|15m|1h|4h|1d)_(\d{4})_(\d{2})\.parquet$", name)
     if m:
         return f"ohlcv_{m[1]}", (int(m[2]), int(m[3]))
@@ -74,6 +74,10 @@ def _classify(name: str) -> tuple[str, tuple[int, int] | None]:
         return "funding", None
     if name == "fear_greed_index.parquet":
         return "fng", None
+    if name == "long_short_ratio.parquet":
+        return "long_short", None
+    if name == "top_trader_ratio.parquet":
+        return "top_trader", None
     return "other", None
 
 
@@ -152,6 +156,10 @@ def main() -> int:
         targets.append(("资金费率", by_type["funding"], 8 * 3600))
     if "fng" in by_type:
         targets.append(("贪婪恐慌", by_type["fng"], 24 * 3600))
+    if "long_short" in by_type:
+        targets.append(("多空账户比", by_type["long_short"], 5 * 60))
+    if "top_trader" in by_type:
+        targets.append(("大户多空比", by_type["top_trader"], 5 * 60))
 
     for label, paths, expected_step_s in targets:
         try:

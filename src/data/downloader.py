@@ -38,7 +38,9 @@ _VISION_KLINES_COLS = [
     "close_time", "quote_volume", "count",
     "taker_buy_volume", "taker_buy_quote_volume", "ignore",
 ]
-_OHLCV_PROJECT = ["open_time", "open", "high", "low", "close", "volume"]
+# 第 10 列 taker_buy_volume = 主动买入成交量（市价单成交时买方为 taker），
+# 用于推导主动买入占比指标（taker_buy_volume / volume）
+_OHLCV_PROJECT = ["open_time", "open", "high", "low", "close", "volume", "taker_buy_volume"]
 
 
 def _month_iter(start: date, end_inclusive: date):
@@ -103,6 +105,7 @@ def _cast_ohlcv(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("low").cast(pl.Float64),
         pl.col("close").cast(pl.Float64),
         pl.col("volume").cast(pl.Float64),
+        pl.col("taker_buy_volume").cast(pl.Float64),
     )
 
 
@@ -249,6 +252,8 @@ def fetch_recent(cfg: DataConfig, timeframe: str, batch_limit: int = 1500) -> di
         "low": [r[3] for r in rows],
         "close": [r[4] for r in rows],
         "volume": [r[5] for r in rows],
+        # Binance fapi REST klines 第 10 列（index 9）= taker_buy_base_asset_volume
+        "taker_buy_volume": [r[9] for r in rows],
     })
     new_df = _cast_ohlcv(raw).unique(subset=["timestamp"]).sort("timestamp")
 

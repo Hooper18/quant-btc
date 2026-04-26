@@ -206,35 +206,110 @@ def _parse_metrics_zip(zip_bytes: bytes) -> pl.DataFrame:
         has_header=True,
         schema_overrides={"create_time": pl.Utf8},
     )
-    return df.select(
+    base = df.select(
         pl.col("create_time")
             .str.to_datetime(format="%Y-%m-%d %H:%M:%S", time_unit="ms")
             .dt.replace_time_zone("UTC")
             .alias("timestamp"),
         pl.col("sum_open_interest").cast(pl.Float64).alias("open_interest"),
         pl.col("sum_open_interest_value").cast(pl.Float64).alias("open_interest_value"),
+        pl.col("count_long_short_ratio").cast(pl.Float64).alias("_ls_ratio"),
+        pl.col("count_toptrader_long_short_ratio").cast(pl.Float64).alias("_tt_count_ratio"),
+        pl.col("sum_toptrader_long_short_ratio").cast(pl.Float64).alias("_tt_pos_ratio"),
     )
+    # 仅保留 OI 三列（保持向后兼容已有月度 parquet schema）
+    return base.select(["timestamp", "open_interest", "open_interest_value"])
+
+
+def _parse_metrics_zip_full(zip_bytes: bytes) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """解析 vision daily metrics ZIP，一次产出三组对齐 DataFrame：
+    - oi: timestamp, open_interest, open_interest_value
+    - long_short_ratio: timestamp, long_account, short_account, long_short_ratio
+    - top_trader_ratio: timestamp, long_account, short_account, long_short_ratio
+
+    多空比换算：vision 仅给出 ratio，由 ratio 反推占比
+        long_short_ratio = N_long / N_short
+        long_account     = ratio / (1 + ratio)
+        short_account    = 1     / (1 + ratio)
+    （long_account + short_account = 1，可直接当作市场情绪比例使用）
+    """
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        if not names:
+            raise ValueError("ZIP 空")
+        with zf.open(names[0]) as f:
+            csv_bytes = f.read()
+    # 历史上某些天的多空比列为空字符串（如 2022-12 部分日期），需要 strict=False 兜底
+    df = pl.read_csv(
+        io.BytesIO(csv_bytes),
+        has_header=True,
+        schema_overrides={
+            "create_time": pl.Utf8,
+            "count_long_short_ratio": pl.Utf8,
+            "count_toptrader_long_short_ratio": pl.Utf8,
+            "sum_toptrader_long_short_ratio": pl.Utf8,
+        },
+    )
+    base = df.select(
+        pl.col("create_time")
+            .str.to_datetime(format="%Y-%m-%d %H:%M:%S", time_unit="ms")
+            .dt.replace_time_zone("UTC")
+            .alias("timestamp"),
+        pl.col("sum_open_interest").cast(pl.Float64).alias("open_interest"),
+        pl.col("sum_open_interest_value").cast(pl.Float64).alias("open_interest_value"),
+        pl.col("count_long_short_ratio").cast(pl.Float64, strict=False).alias("ls_ratio"),
+        pl.col("sum_toptrader_long_short_ratio").cast(pl.Float64, strict=False).alias("tt_pos_ratio"),
+    )
+
+    oi = base.select(["timestamp", "open_interest", "open_interest_value"])
+    ls = base.select(
+        pl.col("timestamp"),
+        (pl.col("ls_ratio") / (1 + pl.col("ls_ratio"))).alias("long_account"),
+        (1 / (1 + pl.col("ls_ratio"))).alias("short_account"),
+        pl.col("ls_ratio").alias("long_short_ratio"),
+    ).filter(pl.col("long_short_ratio").is_not_null())
+    # 大户多空：用 position（仓位金额）口径，比 count（账户数）更代表"实际下注"
+    tt = base.select(
+        pl.col("timestamp"),
+        (pl.col("tt_pos_ratio") / (1 + pl.col("tt_pos_ratio"))).alias("long_account"),
+        (1 / (1 + pl.col("tt_pos_ratio"))).alias("short_account"),
+        pl.col("tt_pos_ratio").alias("long_short_ratio"),
+    ).filter(pl.col("long_short_ratio").is_not_null())
+    return oi, ls, tt
 
 
 def download_open_interest(cfg: DataConfig) -> dict[str, Any]:
-    """从 vision daily metrics 下载 OI，按月聚合写入 open_interest_{YYYY}_{MM}.parquet。
+    """从 vision daily metrics 一次性下载并写入三组 parquet：
+    - open_interest_{YYYY}_{MM}.parquet（按月分区，沿用原约定）
+    - long_short_ratio.parquet（全量单文件）
+    - top_trader_ratio.parquet（全量单文件）
 
-    跨月时 flush 当月桶；最后一个未跨月的桶在循环结束后 flush。已存在的整月文件跳过。
+    跳过策略：当某月 OI 文件 + 两个全量文件都存在时跳过该月；否则下载并累积。
     """
     cfg.symbol_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now(timezone.utc).date()
     cur = cfg.history_start_date
+
     stats: dict[str, Any] = {
         "downloaded_days": 0,
         "skipped_months": 0,
         "failed_days": 0,
         "missing_days": 0,
         "months_written": 0,
+        "ls_rows": 0,
+        "tt_rows": 0,
     }
-    month_buckets: dict[tuple[int, int], list[pl.DataFrame]] = {}
 
-    def _flush(ym: tuple[int, int]) -> None:
-        parts = month_buckets.pop(ym, None)
+    oi_buckets: dict[tuple[int, int], list[pl.DataFrame]] = {}
+    ls_parts: list[pl.DataFrame] = []
+    tt_parts: list[pl.DataFrame] = []
+
+    ls_path = cfg.symbol_dir / "long_short_ratio.parquet"
+    tt_path = cfg.symbol_dir / "top_trader_ratio.parquet"
+    aggregates_exist = ls_path.exists() and tt_path.exists()
+
+    def _flush_oi(ym: tuple[int, int]) -> None:
+        parts = oi_buckets.pop(ym, None)
         if not parts:
             return
         merged = pl.concat(parts).unique(subset=["timestamp"]).sort("timestamp")
@@ -244,11 +319,12 @@ def download_open_interest(cfg: DataConfig) -> dict[str, Any]:
 
     total_days = max((today - cur).days, 1)
     with httpx.Client(follow_redirects=True) as client:
-        with tqdm(desc="持仓量", unit="天", total=total_days) as bar:
+        with tqdm(desc="持仓量+多空比", unit="天", total=total_days) as bar:
             while cur < today:
                 ym = (cur.year, cur.month)
-                month_path = cfg.symbol_dir / f"open_interest_{cur.year:04d}_{cur.month:02d}.parquet"
-                if month_path.exists():
+                oi_month_path = cfg.symbol_dir / f"open_interest_{cur.year:04d}_{cur.month:02d}.parquet"
+                # 仅当 OI 月文件 + 两个汇总文件都已就绪时整月跳过
+                if oi_month_path.exists() and aggregates_exist:
                     if cur.month == 12:
                         nxt = date(cur.year + 1, 1, 1)
                     else:
@@ -271,20 +347,46 @@ def download_open_interest(cfg: DataConfig) -> dict[str, Any]:
                     stats["missing_days"] += 1
                 else:
                     try:
-                        normalized = _parse_metrics_zip(resp.content)
-                        month_buckets.setdefault(ym, []).append(normalized)
+                        oi_df, ls_df, tt_df = _parse_metrics_zip_full(resp.content)
+                        # OI 仍按月聚合；ls/tt 累积成单文件
+                        if not oi_month_path.exists():
+                            oi_buckets.setdefault(ym, []).append(oi_df)
+                        ls_parts.append(ls_df)
+                        tt_parts.append(tt_df)
                         stats["downloaded_days"] += 1
                     except Exception as e:
-                        logger.error("OI %s 解析失败：%s", cur, e)
+                        logger.error("metrics %s 解析失败：%s", cur, e)
                         stats["failed_days"] += 1
 
                 bar.update(1)
                 cur += timedelta(days=1)
                 if cur.month != ym[1]:
-                    _flush(ym)
+                    _flush_oi(ym)
 
-    for ym in list(month_buckets.keys()):
-        _flush(ym)
+    for ym in list(oi_buckets.keys()):
+        _flush_oi(ym)
+
+    # 写入两个汇总 parquet（合并已存在的旧文件以避免数据丢失）
+    if ls_parts:
+        merged_ls = pl.concat(ls_parts).unique(subset=["timestamp"]).sort("timestamp")
+        if ls_path.exists():
+            old = pl.read_parquet(ls_path)
+            merged_ls = pl.concat([old, merged_ls]).unique(subset=["timestamp"]).sort("timestamp")
+        merged_ls.write_parquet(ls_path)
+        stats["ls_rows"] = int(merged_ls.height)
+    elif ls_path.exists():
+        stats["ls_rows"] = int(pl.read_parquet(ls_path).height)
+
+    if tt_parts:
+        merged_tt = pl.concat(tt_parts).unique(subset=["timestamp"]).sort("timestamp")
+        if tt_path.exists():
+            old = pl.read_parquet(tt_path)
+            merged_tt = pl.concat([old, merged_tt]).unique(subset=["timestamp"]).sort("timestamp")
+        merged_tt.write_parquet(tt_path)
+        stats["tt_rows"] = int(merged_tt.height)
+    elif tt_path.exists():
+        stats["tt_rows"] = int(pl.read_parquet(tt_path).height)
+
     return stats
 
 

@@ -209,6 +209,56 @@ class IndicatorEngine:
         )
         return _attach(self.df, **{f"cmf_{period}": self._pl(out, "")})
 
+    # ---------- Phase11 衍生指标（依赖额外数据源）----------
+    def taker_buy_ratio(self) -> pl.DataFrame:
+        """主动买入占比 = taker_buy_volume / volume。
+
+        值域 [0, 1]：>0.5 表示买盘主动，<0.5 表示卖盘主动。
+        需要 DataFrame 含 `taker_buy_volume` 列（来自 Phase11 后的 OHLCV downloader）。
+        """
+        if "taker_buy_volume" not in self.df.columns:
+            raise KeyError(
+                "taker_buy_ratio 需要 'taker_buy_volume' 列；请确认 OHLCV parquet "
+                "是 Phase11 之后下载的（旧版 schema 缺该列）"
+            )
+        return self.df.with_columns(
+            pl.when(pl.col("volume") > 0)
+                .then(pl.col("taker_buy_volume") / pl.col("volume"))
+                .otherwise(None)
+                .alias("taker_buy_ratio")
+        )
+
+    def oi_change(self, period: int = 1) -> pl.DataFrame:
+        """持仓量 N 周期变化率 = OI[t] / OI[t-period] - 1。
+
+        需要 DataFrame 含 `open_interest` 列（通过 data_merger.merge_market_data 注入）。
+        """
+        if "open_interest" not in self.df.columns:
+            raise KeyError(
+                "oi_change 需要 'open_interest' 列；先用 data_merger.merge_market_data "
+                "把 OI 合并到 OHLCV"
+            )
+        col_name = f"oi_change_{period}"
+        return self.df.with_columns(
+            (pl.col("open_interest") / pl.col("open_interest").shift(period) - 1.0).alias(col_name)
+        )
+
+    def fear_greed_ma(self, period: int = 7) -> pl.DataFrame:
+        """恐慌贪婪指数移动平均（period 个 bar 滚动均值）。
+
+        需要 DataFrame 含 `fear_greed` 列（通过 data_merger.merge_market_data 注入；
+        FGI 日频，会被 forward-fill 到每根 K 线）。
+        """
+        if "fear_greed" not in self.df.columns:
+            raise KeyError(
+                "fear_greed_ma 需要 'fear_greed' 列；先用 data_merger.merge_market_data "
+                "把 FGI 合并到 OHLCV"
+            )
+        col_name = f"fear_greed_ma_{period}"
+        return self.df.with_columns(
+            pl.col("fear_greed").cast(pl.Float64).rolling_mean(period).alias(col_name)
+        )
+
     # ---------- 批量 ----------
     def compute_all(
         self,
@@ -229,6 +279,9 @@ class IndicatorEngine:
             "williams_r": self.williams_r, "mfi": self.mfi,
             "bollinger": self.bollinger, "atr": self.atr, "keltner": self.keltner,
             "obv": self.obv, "vwap": self.vwap, "cmf": self.cmf,
+            "taker_buy_ratio": self.taker_buy_ratio,
+            "oi_change": self.oi_change,
+            "fear_greed_ma": self.fear_greed_ma,
         }
         items = list(config.items()) if isinstance(config, dict) else list(config)
         result = self.df
