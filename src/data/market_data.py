@@ -47,7 +47,11 @@ def _retry_get(
 
 
 def download_funding_rate(cfg: DataConfig) -> dict[str, Any]:
-    """全量历史资金费率（覆盖写入 funding_rate.parquet）。"""
+    """全量历史资金费率（REST：fapi.binance.com/fapi/v1/fundingRate，覆盖写入 funding_rate.parquet）。
+
+    注意：fapi.binance.com 在中国大陆 DNS 级被墙；如本机网络无法直连，请改用
+    `download_funding_rate_vision`（走 data.binance.vision CDN，国内可访问）。
+    """
     out_path = cfg.symbol_dir / "funding_rate.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +109,88 @@ def download_funding_rate(cfg: DataConfig) -> dict[str, Any]:
         "path": str(out_path),
         "first": str(df["timestamp"].min()),
         "last": str(df["timestamp"].max()),
+    }
+
+
+def _parse_funding_zip(zip_bytes: bytes) -> pl.DataFrame:
+    """解析 vision 月度 fundingRate ZIP；CSV 列：calc_time(ms), funding_interval_hours, last_funding_rate。"""
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        if not names:
+            raise ValueError("ZIP 空")
+        with zf.open(names[0]) as f:
+            csv_bytes = f.read()
+    # 历史上 vision 偶尔出过无表头的旧文件，统一兜底
+    first = csv_bytes.split(b"\n", 1)[0]
+    has_header = first.startswith(b"calc_time")
+    if has_header:
+        df = pl.read_csv(io.BytesIO(csv_bytes), has_header=True)
+    else:
+        df = pl.read_csv(
+            io.BytesIO(csv_bytes), has_header=False,
+            new_columns=["calc_time", "funding_interval_hours", "last_funding_rate"],
+        )
+    return df.select(
+        pl.col("calc_time")
+            .cast(pl.Int64)
+            .cast(pl.Datetime("ms"))
+            .dt.replace_time_zone("UTC")
+            .alias("timestamp"),
+        pl.col("last_funding_rate").cast(pl.Float64).alias("funding_rate"),
+        pl.col("funding_interval_hours").cast(pl.Int32),
+    )
+
+
+def download_funding_rate_vision(cfg: DataConfig) -> dict[str, Any]:
+    """从 data.binance.vision 月度 fundingRate ZIP 拉取全量历史，合并写入 funding_rate.parquet。
+
+    与 REST 版输出 schema 兼容（timestamp/funding_rate）；额外保留 funding_interval_hours 列。
+    单月失败（404 或解析错）记录到 failed_list 但不中断；其余月份照写。
+    """
+    out_path = cfg.symbol_dir / "funding_rate.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    today = datetime.now(timezone.utc).date()
+    last_y, last_m = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
+
+    months: list[tuple[int, int]] = []
+    y, m = cfg.history_start_date.year, cfg.history_start_date.month
+    while (y, m) <= (last_y, last_m):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+
+    parts: list[pl.DataFrame] = []
+    failed: list[tuple[int, int]] = []
+    with httpx.Client(follow_redirects=True) as client:
+        for y, m in tqdm(months, desc="资金费率(vision)", unit="月"):
+            url = (
+                f"{cfg.binance_vision_base_url}/data/futures/um/monthly/fundingRate/"
+                f"{cfg.symbol}/{cfg.symbol}-fundingRate-{y:04d}-{m:02d}.zip"
+            )
+            resp = _retry_get(client, url, params=None, cfg=cfg, timeout=60.0)
+            if resp is None or resp.status_code == 404:
+                logger.warning("资金费率 %04d-%02d 不存在或下载失败", y, m)
+                failed.append((y, m))
+                continue
+            try:
+                parts.append(_parse_funding_zip(resp.content))
+            except Exception as e:
+                logger.error("资金费率 %04d-%02d 解析失败：%s", y, m, e)
+                failed.append((y, m))
+
+    if not parts:
+        return {"rows": 0, "path": str(out_path), "failed": failed}
+
+    merged = pl.concat(parts).unique(subset=["timestamp"]).sort("timestamp")
+    merged.write_parquet(out_path)
+    return {
+        "rows": int(merged.height),
+        "path": str(out_path),
+        "first": str(merged["timestamp"].min()),
+        "last": str(merged["timestamp"].max()),
+        "failed": failed,
     }
 
 

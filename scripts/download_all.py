@@ -20,7 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from data import (  # noqa: E402
     download_fear_greed_index,
-    download_funding_rate,
+    download_funding_rate_vision,
     download_history,
     download_open_interest,
     fetch_recent,
@@ -102,12 +102,13 @@ def _run_full(cfg: DataConfig, log: logging.Logger) -> int:
             f"失败={hist['failed']} 增量={recent.get('appended', 0)}"
         )
 
-    # 2. 资金费率
-    log.info("=== 资金费率 ===")
+    # 2. 资金费率（走 vision CDN，国内可访问）
+    log.info("=== 资金费率(vision) ===")
     try:
-        fr = download_funding_rate(cfg)
+        fr = download_funding_rate_vision(cfg)
         summary.append(
-            f"资金费率: rows={fr['rows']} 范围={fr.get('first', '-')} → {fr.get('last', '-')}"
+            f"资金费率: rows={fr['rows']} 范围={fr.get('first', '-')} → {fr.get('last', '-')} "
+            f"失败={len(fr.get('failed', []))}月"
         )
     except Exception:
         log.exception("资金费率失败")
