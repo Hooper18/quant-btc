@@ -5,6 +5,7 @@ description = "BTC量化交易系统 — 符号主义规则引擎"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
+    "matplotlib>=3.10.9",
     "pandas>=2.3.3",
     "pandas-ta>=0.4.71b0",
     "polars>=1.40.1",

@@ -4,12 +4,13 @@
 1. 从 data/parquet/{symbol}/ 读取所有 timeframe 的 parquet（合并 monthlies + current）
 2. 按策略 YAML 中引用的指标列名，反推需计算的指标 → IndicatorEngine.compute_all
 3. 加载策略 + 回测配置 → Backtester.run
-4. 打印摘要并把交易记录导出 CSV
+4. 打印摘要、导出交易 CSV
+5. 默认生成可视化报告到 output/backtest_{YYYYmmdd_HHMMSS}/（--no-plot 跳过）
 
 用法：
     uv run python scripts/run_backtest.py
     uv run python scripts/run_backtest.py --strategy config/strategies.yaml \
-        --backtest config/backtest_config.yaml --csv out/trades.csv
+        --backtest config/backtest_config.yaml --no-plot
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import argparse
 import logging
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +28,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from backtest import Backtester  # noqa: E402
+from backtest import Backtester, BacktestVisualizer  # noqa: E402
 from indicators import IndicatorEngine  # noqa: E402
 from utils.config import DataConfig  # noqa: E402
 
@@ -128,7 +130,11 @@ def main() -> int:
     parser.add_argument("--strategy", default=str(PROJECT_ROOT / "config" / "strategies.yaml"))
     parser.add_argument("--backtest", default=str(PROJECT_ROOT / "config" / "backtest_config.yaml"))
     parser.add_argument("--data-config", default=str(PROJECT_ROOT / "config" / "data_config.yaml"))
-    parser.add_argument("--csv", default=str(PROJECT_ROOT / "out" / "trades.csv"))
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="可视化报告输出目录；默认 output/backtest_{YYYYmmdd_HHMMSS}/",
+    )
+    parser.add_argument("--no-plot", action="store_true", help="跳过可视化")
     args = parser.parse_args()
 
     _setup_logging()
@@ -186,9 +192,25 @@ def main() -> int:
     result = bt.run(data_dict, args.strategy, funding_rate_df=fr_df)
     result.print_summary()
 
-    out_csv = Path(args.csv)
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(out_csv)
+    # 输出目录：默认 output/backtest_{ts}/
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+    else:
+        ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = PROJECT_ROOT / "output" / f"backtest_{ts_tag}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    result.to_csv(out_dir / "trades.csv")
+
+    if not args.no_plot:
+        log.info("生成可视化报告 → %s", out_dir)
+        viz = BacktestVisualizer(result, data_dict[bt.primary_tf])
+        report_path = viz.save_report(out_dir)
+        print(f"\n报告已保存到 {out_dir}")
+        print(f"  - HTML: {report_path}")
+        print(f"  - CSV : {out_dir / 'trades.csv'}")
+    else:
+        print(f"\n交易记录已保存到 {out_dir / 'trades.csv'}（已跳过可视化）")
     return 0
 
 
