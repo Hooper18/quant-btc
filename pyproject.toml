@@ -3,4 +3,10 @@ name = "quant-btc"
 version = "0.1.0"
 description = "BTC量化交易系统 — 符号主义规则引擎"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+    "polars>=1.40.1",
+    "pyarrow>=24.0.0",
+    "pyyaml>=6.0.3",
+    "tqdm>=4.67.3",
+]

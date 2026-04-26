@@ -1,0 +1,16 @@
+# BTC/USDT 永续合约数据管道配置
+symbol: "BTCUSDT"
+timeframes: ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+# 历史下载起点
+history_start_date: "2020-01-01"
+
+# 数据存储根目录（相对项目根；Parquet 分区放在 data_dir/{symbol}/ 下）
+data_dir: "data/parquet"
+
+# 数据源
+binance_vision_base_url: "https://data.binance.vision"
+
+# 网络重试（指数退避：第 n 次失败后等 base^n 秒）
+retry_max: 3
+retry_backoff_base: 2
