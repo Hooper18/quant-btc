@@ -1,0 +1,36 @@
+# BTC/USDT 永续合约策略规则
+# 每个策略由 conditions(条件列表) + logic(AND/OR) + action(动作) + 风控参数 组成
+# 列名引用必须与 IndicatorEngine 输出一致（带参数后缀）
+
+strategies:
+  - name: "RSI超买做空"
+    conditions:
+      - indicator: "rsi_14"
+        operator: ">"
+        value: 90
+        timeframe: "1h"
+      - indicator: "macd_histogram_12_26_9"
+        operator: "<"
+        value: 0
+        timeframe: "1h"
+    logic: "AND"
+    action:
+      side: "short"
+      type: "market"
+      size_pct: 30
+    stop_loss_pct: 3
+    take_profit_pct: 5
+
+  - name: "MACD金叉做多"
+    conditions:
+      - indicator: "macd_line_12_26_9"
+        cross: "above"
+        reference: "macd_signal_12_26_9"
+        timeframe: "4h"
+    logic: "AND"
+    action:
+      side: "long"
+      type: "market"
+      size_pct: 20
+    stop_loss_pct: 2
+    take_profit_pct: 4

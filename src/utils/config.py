@@ -24,8 +24,8 @@ class DataConfig:
         return self.data_dir / self.symbol
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "DataConfig":
-        raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8"))
+    def from_yaml(cls, path: Path | str) -> "DataConfig":
+        raw: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls(
             symbol=str(raw["symbol"]),
             timeframes=[str(tf) for tf in raw["timeframes"]],

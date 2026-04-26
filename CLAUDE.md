@@ -40,9 +40,15 @@ quant-btc/
 
 ## 当前阶段
 
-**Phase 1 — 数据管道建设**：
-- ccxt 拉取 BTCUSDT 永续历史 K 线（多周期：1m/5m/15m/1h/4h/1d）
-- Parquet 分区落盘 + 增量追加机制
-- 数据完整性校验（缺失检测、时间戳对齐）
+**Phase 4 已完成 — 指标/规则/回测引擎已搭建**：
 
-后续阶段（不在 Phase 1 范围）：指标层 → 规则引擎 → 回测 → 实盘信号。
+- **Phase 1 数据管道**：vision 月度 ZIP 拉 OHLCV + REST 增量；fapi REST 拉资金费率（CN 网络受限可能为空）；vision daily metrics 拉 OI 按月聚合；alternative.me 拉贪婪恐慌指数。
+- **Phase 2 指标层** `src/indicators/`：`IndicatorEngine` 基于 pandas-ta，输入输出统一 Polars。覆盖趋势/动量/波动率/成交量四大类共 15 个指标；`compute_all(config)` 批量计算；`crossover/crossunder` 工具函数。
+- **Phase 3 规则引擎** `src/engine/`：YAML 描述策略，支持阈值比较、cross above/below、from_above/from_below 状态记忆、AND/OR + 嵌套条件组、跨周期对齐、信号方向冲突仲裁（按 YAML 顺序优先级）。
+- **Phase 4 回测引擎** `src/backtest/`：杠杆永续合约逐 K 线推进；同向加仓/反向先平后开；止损止盈、强平、最大回撤熔断、日内最大亏损、资金费率结算；输出净值曲线 + 总收益/年化/夏普/最大回撤/胜率/盈亏比/平均持仓时间。
+
+入口：
+- `uv run python scripts/download_all.py [--test]` 全量数据下载
+- `uv run python scripts/run_backtest.py [--strategy ... --backtest ... --csv ...]` 一键回测
+
+下阶段方向：参数搜索 / 多策略组合管理 / 实盘信号桥接。
