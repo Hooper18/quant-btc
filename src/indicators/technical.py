@@ -229,8 +229,9 @@ class IndicatorEngine:
         )
 
     def oi_change(self, period: int = 1) -> pl.DataFrame:
-        """持仓量 N 周期变化率 = OI[t] / OI[t-period] - 1。
+        """持仓量 N 周期变化率（百分比）= (OI[t] / OI[t-period] - 1) × 100。
 
+        例：返回 5.0 表示过去 N 根 K 线 OI 上涨 5%；策略 YAML 阈值用 ±5 这种直观数字。
         需要 DataFrame 含 `open_interest` 列（通过 data_merger.merge_market_data 注入）。
         """
         if "open_interest" not in self.df.columns:
@@ -240,7 +241,26 @@ class IndicatorEngine:
             )
         col_name = f"oi_change_{period}"
         return self.df.with_columns(
-            (pl.col("open_interest") / pl.col("open_interest").shift(period) - 1.0).alias(col_name)
+            ((pl.col("open_interest") / pl.col("open_interest").shift(period) - 1.0) * 100.0)
+            .alias(col_name)
+        )
+
+    def rolling_max(self, period: int = 20) -> pl.DataFrame:
+        """过去 N 根 K 线（不含当前）的最高 close。
+
+        实现 = `close.shift(1).rolling_max(period)`；这样
+        ``close > rolling_max_N`` 即"创 N 周期新高"，自身不会"自我证明"。
+        """
+        col_name = f"rolling_max_{period}"
+        return self.df.with_columns(
+            pl.col("close").shift(1).rolling_max(period).alias(col_name)
+        )
+
+    def rolling_min(self, period: int = 20) -> pl.DataFrame:
+        """过去 N 根 K 线（不含当前）的最低 close。配合 ``close < rolling_min_N`` 表"创新低"。"""
+        col_name = f"rolling_min_{period}"
+        return self.df.with_columns(
+            pl.col("close").shift(1).rolling_min(period).alias(col_name)
         )
 
     def fear_greed_ma(self, period: int = 7) -> pl.DataFrame:
@@ -282,6 +302,8 @@ class IndicatorEngine:
             "taker_buy_ratio": self.taker_buy_ratio,
             "oi_change": self.oi_change,
             "fear_greed_ma": self.fear_greed_ma,
+            "rolling_max": self.rolling_max,
+            "rolling_min": self.rolling_min,
         }
         items = list(config.items()) if isinstance(config, dict) else list(config)
         result = self.df

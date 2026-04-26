@@ -1,0 +1,25 @@
+# 增强 RSI 策略：经典超买超卖 + 市场情绪 + 主动盘方向 三重过滤
+# 比单一 RSI 更挑剔：进场时不仅指标极端，还要"群体情绪"和"实时盘口"对齐
+# - 做空：RSI 高位 + FGI 贪婪 + 卖盘主导（Taker 偏卖）
+# - 做多：RSI 低位 + FGI 恐慌 + 买盘主导（Taker 偏买）
+
+strategies:
+  - name: "增强RSI做空"
+    conditions:
+      - {indicator: rsi_14,           operator: ">",  value: 75,   timeframe: "1h"}
+      - {indicator: fear_greed,       operator: ">",  value: 70,   timeframe: "1h"}
+      - {indicator: taker_buy_ratio,  operator: "<",  value: 0.45, timeframe: "1h"}
+    logic: AND
+    action: {side: short, type: market, size_pct: 5}
+    stop_loss_pct: 5
+    take_profit_pct: 6
+
+  - name: "增强RSI做多"
+    conditions:
+      - {indicator: rsi_14,           operator: "<",  value: 30,   timeframe: "1h"}
+      - {indicator: fear_greed,       operator: "<",  value: 30,   timeframe: "1h"}
+      - {indicator: taker_buy_ratio,  operator: ">",  value: 0.55, timeframe: "1h"}
+    logic: AND
+    action: {side: long, type: market, size_pct: 5}
+    stop_loss_pct: 5
+    take_profit_pct: 6

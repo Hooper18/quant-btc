@@ -29,6 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from backtest import Backtester, BacktestVisualizer  # noqa: E402
+from data import merge_market_data  # noqa: E402
 from indicators import IndicatorEngine  # noqa: E402
 from utils.config import DataConfig  # noqa: E402
 
@@ -51,7 +52,75 @@ def _load_ohlcv(cfg: DataConfig, timeframe: str) -> pl.DataFrame | None:
     if not files:
         return None
     parts = [pl.read_parquet(f) for f in files]
-    return pl.concat(parts).unique(subset=["timestamp"]).sort("timestamp")
+    # 不同月份的 parquet 可能有不同列（旧 6 列 vs 新 7 列），用 diagonal_relaxed 对齐
+    return (
+        pl.concat(parts, how="diagonal_relaxed")
+        .unique(subset=["timestamp"])
+        .sort("timestamp")
+    )
+
+
+def _load_oi(cfg: DataConfig) -> pl.DataFrame | None:
+    """合并所有月度 open_interest_*.parquet 为单一 DataFrame。"""
+    files = sorted(cfg.symbol_dir.glob("open_interest_*.parquet"))
+    if not files:
+        return None
+    return (
+        pl.concat([pl.read_parquet(f) for f in files])
+        .unique(subset=["timestamp"])
+        .sort("timestamp")
+    )
+
+
+def _load_single(cfg: DataConfig, name: str) -> pl.DataFrame | None:
+    p = cfg.symbol_dir / name
+    if not p.exists():
+        return None
+    df = pl.read_parquet(p)
+    return df if df.height > 0 else None
+
+
+def load_aux_data(cfg: DataConfig) -> dict[str, pl.DataFrame | None]:
+    """一次性加载所有辅助数据源；缺失返回 None。供 run_backtest / compare / walk_forward 共用。"""
+    return {
+        "funding": _load_single(cfg, "funding_rate.parquet"),
+        "oi": _load_oi(cfg),
+        "fgi": _load_single(cfg, "fear_greed_index.parquet"),
+        "ls": _load_single(cfg, "long_short_ratio.parquet"),
+        "tt": _load_single(cfg, "top_trader_ratio.parquet"),
+    }
+
+
+def build_data_dict(
+    cfg: DataConfig,
+    timeframes: list[str] | set[str],
+    ind_cfg: list[tuple[str, dict[str, Any]]],
+    aux: dict[str, pl.DataFrame | None] | None = None,
+) -> dict[str, pl.DataFrame]:
+    """对每个 TF：加载 OHLCV → merge 辅助数据 → 计算指标。返回 data_dict。
+
+    `aux` 缺省时自动加载（每次调用都会读盘）。多次调用建议传入预加载的 aux。
+    缺失列的策略自然忽略；老 OHLCV（无 taker_buy_volume）也能正常 merge。
+    """
+    if aux is None:
+        aux = load_aux_data(cfg)
+    out: dict[str, pl.DataFrame] = {}
+    for tf in sorted(set(timeframes)):
+        raw = _load_ohlcv(cfg, tf)
+        if raw is None or raw.height == 0:
+            raise FileNotFoundError(f"缺 {tf} 周期 OHLCV 数据")
+        merged = merge_market_data(
+            raw,
+            funding_df=aux.get("funding"),
+            oi_df=aux.get("oi"),
+            fgi_df=aux.get("fgi"),
+            long_short_df=aux.get("ls"),
+            top_trader_df=aux.get("tt"),
+        )
+        out[tf] = (
+            IndicatorEngine(merged).compute_all(ind_cfg) if ind_cfg else merged
+        )
+    return out
 
 
 # 策略 YAML 列名 → IndicatorEngine 配置的解析表
@@ -89,6 +158,12 @@ _INDICATOR_PATTERNS: list[tuple[re.Pattern[str], str, callable]] = [
     ),
     (re.compile(r"^obv$"), "obv", lambda m: {}),
     (re.compile(r"^vwap$"), "vwap", lambda m: {}),
+    # Phase11/12 衍生指标
+    (re.compile(r"^taker_buy_ratio$"), "taker_buy_ratio", lambda m: {}),
+    (re.compile(r"^oi_change_(\d+)$"), "oi_change", lambda m: {"period": int(m[1])}),
+    (re.compile(r"^fear_greed_ma_(\d+)$"), "fear_greed_ma", lambda m: {"period": int(m[1])}),
+    (re.compile(r"^rolling_max_(\d+)$"), "rolling_max", lambda m: {"period": int(m[1])}),
+    (re.compile(r"^rolling_min_(\d+)$"), "rolling_min", lambda m: {"period": int(m[1])}),
 ]
 
 
@@ -177,25 +252,25 @@ def main() -> int:
     ind_cfg = _collect_required_indicators(strategies)
     log.info("将计算指标：%s", ind_cfg)
 
-    data_dict: dict[str, pl.DataFrame] = {}
-    for tf in used_tfs:
-        raw = _load_ohlcv(data_cfg, tf)
-        if raw is None or raw.height == 0:
-            log.error("缺少 %s 周期 parquet 数据，无法回测", tf)
-            return 2
-        log.info("%s 行数=%d 范围=%s → %s", tf, raw.height, raw["timestamp"].min(), raw["timestamp"].max())
-        engine = IndicatorEngine(raw)
-        with_ind = engine.compute_all(ind_cfg) if ind_cfg else raw
-        data_dict[tf] = with_ind
+    # 一次性加载辅助数据 + 合并 + 计算指标
+    aux = load_aux_data(data_cfg)
+    log.info(
+        "辅助数据：funding=%s OI=%s FGI=%s LS=%s TT=%s",
+        "OK" if aux["funding"] is not None else "缺失",
+        "OK" if aux["oi"] is not None else "缺失",
+        "OK" if aux["fgi"] is not None else "缺失",
+        "OK" if aux["ls"] is not None else "缺失",
+        "OK" if aux["tt"] is not None else "缺失",
+    )
+    try:
+        data_dict = build_data_dict(data_cfg, used_tfs, ind_cfg, aux=aux)
+    except FileNotFoundError as e:
+        log.error(str(e))
+        return 2
+    for tf, df in data_dict.items():
+        log.info("%s: 行数=%d 列=%d", tf, df.height, len(df.columns))
 
-    # 资金费率（可选）
-    fr_path = data_cfg.symbol_dir / "funding_rate.parquet"
-    fr_df: pl.DataFrame | None = None
-    if fr_path.exists():
-        fr_df = pl.read_parquet(fr_path)
-        if fr_df.height == 0:
-            fr_df = None
-            log.warning("资金费率 parquet 为空，回测将忽略资金费率")
+    fr_df = aux.get("funding")
 
     log.info("开始回测：bars=%d", data_dict[bt.primary_tf].height)
     result = bt.run(data_dict, args.strategy, funding_rate_df=fr_df)

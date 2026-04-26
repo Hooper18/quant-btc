@@ -1,0 +1,27 @@
+# 情绪反向：FGI 极端 + 散户多空比反向 + RSI 同向
+# 散户多空比是经典反向指标——散户重仓做多时，市场往往见顶
+# - 做多：FGI 极度恐慌(<20) + 散户偏多(>2.5，可能在抄底亏钱) + RSI 超卖(<35)
+#         = 大众恐慌但仓位还重 → 还要继续清仓 → 真正底部还没到？反过来想：
+#         FGI 极度恐慌时机构往往已抛完，散户仍在硬扛，这种状态接近反转
+# - 做空：FGI 极度贪婪(>80) + 散户偏空(<1.5，错过涨幅在追空) + RSI 超买(>65)
+
+strategies:
+  - name: "情绪反向做多"
+    conditions:
+      - {indicator: fear_greed, operator: "<",  value: 20,  timeframe: "1h"}
+      - {indicator: ls_ratio,   operator: ">",  value: 2.5, timeframe: "1h"}
+      - {indicator: rsi_14,     operator: "<",  value: 35,  timeframe: "1h"}
+    logic: AND
+    action: {side: long, type: market, size_pct: 5}
+    stop_loss_pct: 5
+    take_profit_pct: 8
+
+  - name: "情绪反向做空"
+    conditions:
+      - {indicator: fear_greed, operator: ">",  value: 80,  timeframe: "1h"}
+      - {indicator: ls_ratio,   operator: "<",  value: 1.5, timeframe: "1h"}
+      - {indicator: rsi_14,     operator: ">",  value: 65,  timeframe: "1h"}
+    logic: AND
+    action: {side: short, type: market, size_pct: 5}
+    stop_loss_pct: 5
+    take_profit_pct: 8

@@ -1,0 +1,26 @@
+# OI 背离：价格创极值但 OI 反向 → 假突破/底部吸筹
+# - 做空：close 创 48 根新高（rolling_max_48 = 过去 48 根中最高 close，不含当前）
+#         + oi_change_24（过去 24h OI 变化%）< -5%
+#         （价格新高但 OI 大幅下降 = 多头平仓推升，无新资金入场，假突破）
+# - 做多：close 创 48 根新低 + oi_change_24 > +5%
+#         （价格新低但 OI 大幅上升 = 空头加仓 OR 抄底盘进场，常预示反弹）
+# 依赖 IndicatorEngine.rolling_max/rolling_min（Phase12 新增）+ oi_change（已升级为百分比）
+
+strategies:
+  - name: "OI背离做空"
+    conditions:
+      - {indicator: close,          operator: ">",  value: rolling_max_48, timeframe: "1h"}
+      - {indicator: oi_change_24,   operator: "<",  value: -5,             timeframe: "1h"}
+    logic: AND
+    action: {side: short, type: market, size_pct: 5}
+    stop_loss_pct: 3
+    take_profit_pct: 6
+
+  - name: "OI背离做多"
+    conditions:
+      - {indicator: close,          operator: "<",  value: rolling_min_48, timeframe: "1h"}
+      - {indicator: oi_change_24,   operator: ">",  value: 5,              timeframe: "1h"}
+    logic: AND
+    action: {side: long, type: market, size_pct: 5}
+    stop_loss_pct: 3
+    take_profit_pct: 6

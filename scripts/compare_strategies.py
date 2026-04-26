@@ -36,10 +36,11 @@ from backtest.visualizer import _DARK_RC, _COLOR_BTC  # noqa: E402
 from indicators import IndicatorEngine  # noqa: E402
 from utils.config import DataConfig  # noqa: E402
 
-# 复用 run_backtest 的指标解析 / OHLCV 加载逻辑
+# 复用 run_backtest 的指标解析 / 数据加载（含 merger）逻辑
 from run_backtest import (  # noqa: E402
     _collect_required_indicators,
-    _load_ohlcv,
+    build_data_dict,
+    load_aux_data,
 )
 
 
@@ -67,7 +68,8 @@ def _used_timeframes(strategies: list[dict[str, Any]], primary: str) -> list[str
 
 
 def _run_one(strategy_path: Path, data_cfg: DataConfig, bt: Backtester,
-             fr_df: pl.DataFrame | None, log: logging.Logger) -> tuple[str, BacktestResult] | None:
+             aux: dict[str, pl.DataFrame | None], log: logging.Logger,
+             ) -> tuple[str, BacktestResult] | None:
     with strategy_path.open(encoding="utf-8") as f:
         strat_yaml = yaml.safe_load(f) or {}
     strategies = strat_yaml.get("strategies", [])
@@ -78,19 +80,15 @@ def _run_one(strategy_path: Path, data_cfg: DataConfig, bt: Backtester,
     used_tfs = _used_timeframes(strategies, bt.primary_tf)
     ind_cfg = _collect_required_indicators(strategies)
 
-    data_dict: dict[str, pl.DataFrame] = {}
-    for tf in used_tfs:
-        raw = _load_ohlcv(data_cfg, tf)
-        if raw is None or raw.height == 0:
-            log.error("[%s] 缺少 %s 周期数据", strategy_path.name, tf)
-            return None
-        data_dict[tf] = (
-            IndicatorEngine(raw).compute_all(ind_cfg) if ind_cfg else raw
-        )
+    try:
+        data_dict = build_data_dict(data_cfg, used_tfs, ind_cfg, aux=aux)
+    except FileNotFoundError as e:
+        log.error("[%s] %s", strategy_path.name, e)
+        return None
 
     name = strategy_path.stem
     log.info("[%s] 开始回测：bars=%d", name, data_dict[bt.primary_tf].height)
-    result = bt.run(data_dict, str(strategy_path), funding_rate_df=fr_df)
+    result = bt.run(data_dict, str(strategy_path), funding_rate_df=aux.get("funding"))
     return name, result
 
 
@@ -163,12 +161,16 @@ def main() -> int:
     data_cfg = DataConfig.from_yaml(args.data_config)
     bt = Backtester.from_yaml(args.backtest)
 
-    fr_df: pl.DataFrame | None = None
-    fr_path = data_cfg.symbol_dir / "funding_rate.parquet"
-    if fr_path.exists():
-        fr_df = pl.read_parquet(fr_path)
-        if fr_df.height == 0:
-            fr_df = None
+    # 一次性加载辅助数据（funding/OI/FGI/ls/tt）；多策略跑共用，避免重复读盘
+    aux = load_aux_data(data_cfg)
+    log.info(
+        "辅助数据：funding=%s OI=%s FGI=%s LS=%s TT=%s",
+        "OK" if aux["funding"] is not None else "缺失",
+        "OK" if aux["oi"] is not None else "缺失",
+        "OK" if aux["fgi"] is not None else "缺失",
+        "OK" if aux["ls"] is not None else "缺失",
+        "OK" if aux["tt"] is not None else "缺失",
+    )
 
     results: list[tuple[str, BacktestResult]] = []
     for sp in args.strategies:
@@ -176,7 +178,7 @@ def main() -> int:
         if not path.exists():
             log.error("文件不存在：%s", sp)
             continue
-        out = _run_one(path, data_cfg, bt, fr_df, log)
+        out = _run_one(path, data_cfg, bt, aux, log)
         if out is not None:
             results.append(out)
 

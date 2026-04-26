@@ -1,0 +1,28 @@
+# 趋势跟踪：双 EMA 交叉 + ADX 确认有趋势
+# - ADX > 25 才算"趋势行情"，过滤震荡假信号
+# - 多空对称设计
+
+strategies:
+  - name: "EMA金叉ADX确认做多"
+    conditions:
+      - indicator: ema_12
+        cross: above
+        reference: ema_26
+        timeframe: "1h"
+      - {indicator: adx_14, operator: ">", value: 25, timeframe: "1h"}
+    logic: AND
+    action: {side: long, type: market, size_pct: 5}
+    stop_loss_pct: 4
+    take_profit_pct: 8
+
+  - name: "EMA死叉ADX确认做空"
+    conditions:
+      - indicator: ema_12
+        cross: below
+        reference: ema_26
+        timeframe: "1h"
+      - {indicator: adx_14, operator: ">", value: 25, timeframe: "1h"}
+    logic: AND
+    action: {side: short, type: market, size_pct: 5}
+    stop_loss_pct: 4
+    take_profit_pct: 8
