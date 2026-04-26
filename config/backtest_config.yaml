@@ -4,7 +4,7 @@ leverage: 10                # 杠杆倍数（合约保证金 = notional / levera
 fee_rate: 0.0005            # 合约 taker 手续费率（双边）
 slippage: 0.0005            # 滑点：开仓买入按 +0.05%、卖出按 -0.05% 成交
 maintenance_margin_rate: 0.004   # 维持保证金率（强平阈值用）
-max_drawdown_pct: 0.50      # 最大回撤熔断（>50% 强制平仓停止交易）
+max_drawdown_pct: 0.30      # 最大回撤熔断（>30% 强制平仓停止交易）
 funding_rate_epochs_utc: [0, 8, 16]   # 资金费率结算时刻（UTC 小时）
 primary_timeframe: "1h"     # 回测推进的主时间周期
 daily_max_loss_pct: null    # 日最大亏损（null 关闭）；例 0.10 表示 10%
