@@ -1,0 +1,49 @@
+# 多指标复合策略：均线交叉 + RSI 极端 + 高周期 MACD 确认
+# - 做多：1h EMA12 上穿 EMA26 + 1h RSI(14) < 40 + 4h MACD 柱 > 0
+# - 做空：1h EMA12 下穿 EMA26 + 1h RSI(14) > 60 + 4h MACD 柱 < 0
+# 三重确认：1h 给出短期信号，4h MACD 提供高周期方向滤波
+
+strategies:
+  - name: "EMA金叉+RSI低位+4h MACD多头"
+    conditions:
+      - indicator: "ema_12"
+        cross: "above"
+        reference: "ema_26"
+        timeframe: "1h"
+      - indicator: "rsi_14"
+        operator: "<"
+        value: 40
+        timeframe: "1h"
+      - indicator: "macd_histogram_12_26_9"
+        operator: ">"
+        value: 0
+        timeframe: "4h"
+    logic: "AND"
+    action:
+      side: "long"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 4
+    take_profit_pct: 7
+
+  - name: "EMA死叉+RSI高位+4h MACD空头"
+    conditions:
+      - indicator: "ema_12"
+        cross: "below"
+        reference: "ema_26"
+        timeframe: "1h"
+      - indicator: "rsi_14"
+        operator: ">"
+        value: 60
+        timeframe: "1h"
+      - indicator: "macd_histogram_12_26_9"
+        operator: "<"
+        value: 0
+        timeframe: "4h"
+    logic: "AND"
+    action:
+      side: "short"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 4
+    take_profit_pct: 7

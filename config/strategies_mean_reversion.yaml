@@ -1,0 +1,41 @@
+# 极端均值回归策略：短周期 RSI + 布林带极端突破
+# - 1h RSI(6) > 90 且 收盘 > 布林带上轨(20,2) → 做空（极度超买，预期回归）
+# - 1h RSI(6) < 10 且 收盘 < 布林带下轨(20,2) → 做多（极度超卖，预期反弹）
+# RSI(6) 比 RSI(14) 更敏感，配合布林带能精准捕捉极端时刻
+
+strategies:
+  - name: "极端超买做空"
+    conditions:
+      - indicator: "rsi_6"
+        operator: ">"
+        value: 90
+        timeframe: "1h"
+      - indicator: "close"
+        operator: ">"
+        value: "bb_upper_20_2.0"
+        timeframe: "1h"
+    logic: "AND"
+    action:
+      side: "short"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 3
+    take_profit_pct: 5
+
+  - name: "极端超卖做多"
+    conditions:
+      - indicator: "rsi_6"
+        operator: "<"
+        value: 10
+        timeframe: "1h"
+      - indicator: "close"
+        operator: "<"
+        value: "bb_lower_20_2.0"
+        timeframe: "1h"
+    logic: "AND"
+    action:
+      side: "long"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 3
+    take_profit_pct: 5

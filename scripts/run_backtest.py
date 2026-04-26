@@ -100,16 +100,21 @@ def _parse_indicator_name(name: str) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
-def _collect_required_indicators(strategies: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """递归扫描策略条件树，收集所有引用到的指标列名 → IndicatorEngine 配置。"""
-    cfg: dict[str, dict[str, Any]] = {}
+def _collect_required_indicators(strategies: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """递归扫描策略条件树，收集所有引用到的指标列名 → IndicatorEngine 配置。
+
+    返回 list[(name, params)]，允许同一指标有多组参数（如 ema_12 + ema_26）。
+    按出现顺序去重相同 (name, frozenset(params)) 组合。
+    """
+    seen: set[tuple[str, frozenset]] = set()
+    out: list[tuple[str, dict[str, Any]]] = []
 
     def walk(cond: dict[str, Any]) -> None:
         if "conditions" in cond:
             for sub in cond["conditions"]:
                 walk(sub)
             return
-        for field in ("indicator", "reference"):
+        for field in ("indicator", "reference", "value"):
             v = cond.get(field)
             if not isinstance(v, str):
                 continue
@@ -117,12 +122,16 @@ def _collect_required_indicators(strategies: list[dict[str, Any]]) -> dict[str, 
             if parsed is None:
                 continue
             key, params = parsed
-            cfg.setdefault(key, params)
+            sig = (key, frozenset((k, params[k]) for k in sorted(params)))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append((key, params))
 
     for s in strategies:
         for c in s.get("conditions", []):
             walk(c)
-    return cfg
+    return out
 
 
 def main() -> int:

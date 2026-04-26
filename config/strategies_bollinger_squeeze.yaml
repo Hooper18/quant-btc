@@ -1,0 +1,41 @@
+# 布林带突破 + 趋势确认策略
+# - 收盘价突破布林带上轨(20,2) 且 ADX(14) > 25 → 做多（趋势爆发）
+# - 收盘价跌破布林带下轨(20,2) 且 ADX(14) > 25 → 做空（趋势下行）
+# ADX 过滤掉无趋势的震荡区，避免布林带在窄区频繁假突破
+
+strategies:
+  - name: "布林上轨突破做多"
+    conditions:
+      - indicator: "close"
+        operator: ">"
+        value: "bb_upper_20_2.0"
+        timeframe: "1h"
+      - indicator: "adx_14"
+        operator: ">"
+        value: 25
+        timeframe: "1h"
+    logic: "AND"
+    action:
+      side: "long"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 3
+    take_profit_pct: 6
+
+  - name: "布林下轨突破做空"
+    conditions:
+      - indicator: "close"
+        operator: "<"
+        value: "bb_lower_20_2.0"
+        timeframe: "1h"
+      - indicator: "adx_14"
+        operator: ">"
+        value: 25
+        timeframe: "1h"
+    logic: "AND"
+    action:
+      side: "short"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 3
+    take_profit_pct: 6

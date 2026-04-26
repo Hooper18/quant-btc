@@ -1,0 +1,33 @@
+# RSI 背离策略：从极值区回归时进场
+# - 1h RSI(14) 曾上穿 80 后回落跌破 70 → 做空（动能耗尽）
+# - 1h RSI(14) 曾下穿 20 后反弹突破 30 → 做多（超卖反弹）
+# 用 from_above/to_below 状态记忆触发，回避高位 RSI 持续震荡的伪信号
+
+strategies:
+  - name: "RSI从80回落做空"
+    conditions:
+      - indicator: "rsi_14"
+        from_above: 80
+        to_below: 70
+        timeframe: "1h"
+    logic: "AND"
+    action:
+      side: "short"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 5
+    take_profit_pct: 8
+
+  - name: "RSI从20反弹做多"
+    conditions:
+      - indicator: "rsi_14"
+        from_below: 20
+        to_above: 30
+        timeframe: "1h"
+    logic: "AND"
+    action:
+      side: "long"
+      type: "market"
+      size_pct: 10
+    stop_loss_pct: 5
+    take_profit_pct: 8

@@ -43,8 +43,16 @@ def _attach(df: pl.DataFrame, **new_cols: pl.Series | list) -> pl.DataFrame:
     return df.with_columns(series_list)
 
 
-def _pdseries_to_pl(s: pd.Series, name: str) -> pl.Series:
-    return pl.Series(name, s.astype("float64").tolist())
+def _pdseries_to_pl(s: pd.Series | None, name: str, n_expected: int | None = None) -> pl.Series:
+    """pandas Series → Polars Series；兼容 pandas-ta 在边界参数下返回 None / 空 / 短于预期长度。"""
+    if s is None or len(s) == 0:
+        if n_expected is None:
+            return pl.Series(name, [], dtype=pl.Float64)
+        return pl.Series(name, [None] * n_expected, dtype=pl.Float64)
+    vals = s.astype("float64").tolist()
+    if n_expected is not None and len(vals) < n_expected:
+        vals = [None] * (n_expected - len(vals)) + vals  # type: ignore[list-item]
+    return pl.Series(name, vals, dtype=pl.Float64)
 
 
 class IndicatorEngine:
@@ -61,6 +69,7 @@ class IndicatorEngine:
         if missing:
             raise ValueError(f"DataFrame 缺列：{missing}")
         self.df = df.sort("timestamp")
+        self.n = self.df.height
         self._pd: pd.DataFrame | None = None
 
     @property
@@ -69,14 +78,21 @@ class IndicatorEngine:
             self._pd = _to_pandas(self.df)
         return self._pd
 
+    def _pl(self, s: pd.Series | None, name: str = "") -> pl.Series:
+        """pandas → polars；自动按 self.n 对齐（处理 pandas-ta 在边界参数下的 None/空返回）。"""
+        return _pdseries_to_pl(s, name, n_expected=self.n)
+
     # ---------- 趋势类 ----------
     def sma(self, period: int = 20) -> pl.DataFrame:
+        # period=1 SMA 数学上等于 close；pandas-ta 在 length=1 会抛 ValueError，绕开
+        if period <= 1:
+            return _attach(self.df, **{f"sma_{period}": self.df["close"].cast(pl.Float64)})
         out = ta.sma(self.pd["close"], length=period)
-        return _attach(self.df, **{f"sma_{period}": _pdseries_to_pl(out, f"sma_{period}")})
+        return _attach(self.df, **{f"sma_{period}": self._pl(out, f"sma_{period}")})
 
     def ema(self, period: int = 20) -> pl.DataFrame:
         out = ta.ema(self.pd["close"], length=period)
-        return _attach(self.df, **{f"ema_{period}": _pdseries_to_pl(out, f"ema_{period}")})
+        return _attach(self.df, **{f"ema_{period}": self._pl(out, f"ema_{period}")})
 
     def macd(self, fast: int = 12, slow: int = 26, signal: int = 9) -> pl.DataFrame:
         out = ta.macd(self.pd["close"], fast=fast, slow=slow, signal=signal)
@@ -84,9 +100,9 @@ class IndicatorEngine:
         return _attach(
             self.df,
             **{
-                f"macd_line_{suffix}": _pdseries_to_pl(out[f"MACD_{suffix}"], ""),
-                f"macd_histogram_{suffix}": _pdseries_to_pl(out[f"MACDh_{suffix}"], ""),
-                f"macd_signal_{suffix}": _pdseries_to_pl(out[f"MACDs_{suffix}"], ""),
+                f"macd_line_{suffix}": self._pl(out[f"MACD_{suffix}"], ""),
+                f"macd_histogram_{suffix}": self._pl(out[f"MACDh_{suffix}"], ""),
+                f"macd_signal_{suffix}": self._pl(out[f"MACDs_{suffix}"], ""),
             },
         )
 
@@ -95,16 +111,16 @@ class IndicatorEngine:
         return _attach(
             self.df,
             **{
-                f"adx_{period}": _pdseries_to_pl(out[f"ADX_{period}"], ""),
-                f"dmp_{period}": _pdseries_to_pl(out[f"DMP_{period}"], ""),
-                f"dmn_{period}": _pdseries_to_pl(out[f"DMN_{period}"], ""),
+                f"adx_{period}": self._pl(out[f"ADX_{period}"], ""),
+                f"dmp_{period}": self._pl(out[f"DMP_{period}"], ""),
+                f"dmn_{period}": self._pl(out[f"DMN_{period}"], ""),
             },
         )
 
     # ---------- 动量类 ----------
     def rsi(self, period: int = 14) -> pl.DataFrame:
         out = ta.rsi(self.pd["close"], length=period)
-        return _attach(self.df, **{f"rsi_{period}": _pdseries_to_pl(out, "")})
+        return _attach(self.df, **{f"rsi_{period}": self._pl(out, "")})
 
     def stoch(self, k_period: int = 14, d_period: int = 3, smooth_k: int = 3) -> pl.DataFrame:
         out = ta.stoch(
@@ -115,24 +131,24 @@ class IndicatorEngine:
         return _attach(
             self.df,
             **{
-                f"stoch_k_{suffix}": _pdseries_to_pl(out[f"STOCHk_{suffix}"], ""),
-                f"stoch_d_{suffix}": _pdseries_to_pl(out[f"STOCHd_{suffix}"], ""),
+                f"stoch_k_{suffix}": self._pl(out[f"STOCHk_{suffix}"], ""),
+                f"stoch_d_{suffix}": self._pl(out[f"STOCHd_{suffix}"], ""),
             },
         )
 
     def cci(self, period: int = 20) -> pl.DataFrame:
         out = ta.cci(self.pd["high"], self.pd["low"], self.pd["close"], length=period)
-        return _attach(self.df, **{f"cci_{period}": _pdseries_to_pl(out, "")})
+        return _attach(self.df, **{f"cci_{period}": self._pl(out, "")})
 
     def williams_r(self, period: int = 14) -> pl.DataFrame:
         out = ta.willr(self.pd["high"], self.pd["low"], self.pd["close"], length=period)
-        return _attach(self.df, **{f"williams_r_{period}": _pdseries_to_pl(out, "")})
+        return _attach(self.df, **{f"williams_r_{period}": self._pl(out, "")})
 
     def mfi(self, period: int = 14) -> pl.DataFrame:
         out = ta.mfi(
             self.pd["high"], self.pd["low"], self.pd["close"], self.pd["volume"], length=period
         )
-        return _attach(self.df, **{f"mfi_{period}": _pdseries_to_pl(out, "")})
+        return _attach(self.df, **{f"mfi_{period}": self._pl(out, "")})
 
     # ---------- 波动率类 ----------
     def bollinger(self, period: int = 20, std_dev: float = 2.0) -> pl.DataFrame:
@@ -145,15 +161,15 @@ class IndicatorEngine:
         return _attach(
             self.df,
             **{
-                f"bb_lower_{suffix}": _pdseries_to_pl(out[bbl], ""),
-                f"bb_middle_{suffix}": _pdseries_to_pl(out[bbm], ""),
-                f"bb_upper_{suffix}": _pdseries_to_pl(out[bbu], ""),
+                f"bb_lower_{suffix}": self._pl(out[bbl], ""),
+                f"bb_middle_{suffix}": self._pl(out[bbm], ""),
+                f"bb_upper_{suffix}": self._pl(out[bbu], ""),
             },
         )
 
     def atr(self, period: int = 14) -> pl.DataFrame:
         out = ta.atr(self.pd["high"], self.pd["low"], self.pd["close"], length=period)
-        return _attach(self.df, **{f"atr_{period}": _pdseries_to_pl(out, "")})
+        return _attach(self.df, **{f"atr_{period}": self._pl(out, "")})
 
     def keltner(self, period: int = 20, atr_period: int = 10, multiplier: float = 2.0) -> pl.DataFrame:
         out = ta.kc(
@@ -169,35 +185,42 @@ class IndicatorEngine:
         return _attach(
             self.df,
             **{
-                f"kc_lower_{suffix}": _pdseries_to_pl(out[kcl], ""),
-                f"kc_middle_{suffix}": _pdseries_to_pl(out[kcb], ""),
-                f"kc_upper_{suffix}": _pdseries_to_pl(out[kcu], ""),
+                f"kc_lower_{suffix}": self._pl(out[kcl], ""),
+                f"kc_middle_{suffix}": self._pl(out[kcb], ""),
+                f"kc_upper_{suffix}": self._pl(out[kcu], ""),
             },
         )
 
     # ---------- 成交量类 ----------
     def obv(self) -> pl.DataFrame:
         out = ta.obv(self.pd["close"], self.pd["volume"])
-        return _attach(self.df, obv=_pdseries_to_pl(out, ""))
+        return _attach(self.df, obv=self._pl(out, ""))
 
     def vwap(self) -> pl.DataFrame:
         # pandas-ta 的 vwap 需要 DatetimeIndex
         pdf = self.pd.copy()
         pdf.index = pd.DatetimeIndex(pdf["timestamp"])
         out = ta.vwap(pdf["high"], pdf["low"], pdf["close"], pdf["volume"])
-        return _attach(self.df, vwap=_pdseries_to_pl(out.reset_index(drop=True), ""))
+        return _attach(self.df, vwap=self._pl(out.reset_index(drop=True), ""))
 
     def cmf(self, period: int = 20) -> pl.DataFrame:
         out = ta.cmf(
             self.pd["high"], self.pd["low"], self.pd["close"], self.pd["volume"], length=period
         )
-        return _attach(self.df, **{f"cmf_{period}": _pdseries_to_pl(out, "")})
+        return _attach(self.df, **{f"cmf_{period}": self._pl(out, "")})
 
     # ---------- 批量 ----------
-    def compute_all(self, config: dict[str, dict[str, Any]]) -> pl.DataFrame:
+    def compute_all(
+        self,
+        config: dict[str, dict[str, Any]] | list[tuple[str, dict[str, Any]]],
+    ) -> pl.DataFrame:
         """按配置批量计算指标，逐次合并到一份 DataFrame。
 
-        config 例：{"rsi": {"period": 14}, "macd": {"fast": 12, "slow": 26, "signal": 9}}
+        config 支持两种格式：
+        - dict 形式（每种指标只用一组参数）：
+          ``{"rsi": {"period": 14}, "macd": {"fast": 12, "slow": 26, "signal": 9}}``
+        - list[tuple] 形式（同一指标可有多组参数，例如 ema_12 + ema_26）：
+          ``[("ema", {"period": 12}), ("ema", {"period": 26})]``
         未知 key 会抛 KeyError，避免拼写错误静默失败。
         """
         method_map = {
@@ -207,14 +230,16 @@ class IndicatorEngine:
             "bollinger": self.bollinger, "atr": self.atr, "keltner": self.keltner,
             "obv": self.obv, "vwap": self.vwap, "cmf": self.cmf,
         }
+        items = list(config.items()) if isinstance(config, dict) else list(config)
         result = self.df
-        for name, params in config.items():
+        for name, params in items:
             if name not in method_map:
                 raise KeyError(f"未知指标 {name}；可选：{sorted(method_map)}")
             params = params or {}
             # 用临时引擎承载已累积的列，确保下一次基于最新结果
             tmp = IndicatorEngine.__new__(IndicatorEngine)
             tmp.df = result
+            tmp.n = result.height
             tmp._pd = None
             new_df = method_map[name].__func__(tmp, **params)
             # 合并新增列（避免重复）

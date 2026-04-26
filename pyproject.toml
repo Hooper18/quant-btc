@@ -14,3 +14,8 @@ dependencies = [
     "tqdm>=4.67.3",
     "tzdata>=2026.2",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

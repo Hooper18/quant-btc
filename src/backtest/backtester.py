@@ -292,9 +292,11 @@ class Backtester:
             ts = ts_col[i]
             o, h, l, c = open_col[i], high_col[i], low_col[i], close_col[i]
 
-            # 资金费率结算（每根 K 线检查跨过的 epoch）
-            if pm.position.size != 0 and self.funding_epochs:
-                if last_funding_check_ts is not None:
+            # 资金费率结算（每根 K 线检查上次检查点到当前 ts 之间跨过的 epoch）
+            # last_funding_check_ts 必须每 bar 更新，不能只在持仓时更新——否则开仓后第
+            # 一次结算会丢失中间的 epoch（开仓 ts → 当前 ts 之间被错过）
+            if self.funding_epochs:
+                if pm.position.size != 0 and last_funding_check_ts is not None:
                     fr = self._apply_funding(
                         pm, last_funding_check_ts, ts, fr_ts, fr_val,
                     )
@@ -333,7 +335,11 @@ class Backtester:
                 signals = []
 
             # 4) 执行信号
+            # 已持有同向仓位 → 跳过（避免持续状态条件每 bar 重复加仓导致仓位线性放大）
+            # 反向信号仍允许，由 _execute_signal 内部先平后开
             for sig in signals:
+                if pm.position.size != 0 and pm.position.side == sig.side:
+                    continue
                 balance += self._execute_signal(pm, sig, c, ts, balance, trades)
 
             # 5) 净值推进 + 风控熔断

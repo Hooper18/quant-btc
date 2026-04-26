@@ -1,7 +1,7 @@
 """符号主义规则引擎：YAML 策略定义 → 信号生成。
 
 支持的条件类型：
-- 阈值比较：indicator + operator(>/</>=/<=/==/!=) + value
+- 阈值比较：indicator + operator(>/</>=/<=/==/!=) + value（数字 或 另一指标列名）
 - 交叉检测：indicator + cross(above/below) + reference（值或另一个 indicator）
 - 状态记忆：indicator + from_above/from_below(触发阈) + to_below/to_above(确认阈)
 - 嵌套：conditions: [...] + logic: AND/OR
@@ -162,12 +162,15 @@ class RuleEngine:
         if cur is None:
             return False
 
-        # 1) 阈值比较
+        # 1) 阈值比较；value 支持数字 或 指标列名（同 timeframe 取值）
         if "operator" in cond and "value" in cond:
             op = cond["operator"]
             if op not in _OPS:
                 raise ValueError(f"未知 operator {op}")
-            return bool(_OPS[op](cur, float(cond["value"])))
+            rhs = self._resolve_reference(cond["value"], tf, ts)
+            if rhs is None:
+                return False
+            return bool(_OPS[op](cur, rhs))
 
         # 2) 交叉检测
         if "cross" in cond and "reference" in cond:
