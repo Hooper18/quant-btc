@@ -122,14 +122,22 @@ def _parse_vision_zip(zip_bytes: bytes) -> pl.DataFrame:
     return _cast_ohlcv(df.select(_OHLCV_PROJECT))
 
 
-def download_history(cfg: DataConfig, timeframe: str, end_date: date | None = None) -> dict[str, Any]:
-    """下载 [history_start_date, 上月底] 区间所有月度 OHLCV。
+def download_history(
+    cfg: DataConfig,
+    timeframe: str,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> dict[str, Any]:
+    """下载 [start_date 或 cfg.history_start_date, 上月底] 区间所有月度 OHLCV。
 
     幂等：已存在的 monthly parquet 跳过。失败月份记录到 failed_list 但不中断后续。
+    `start_date` / `end_date` 为可选关键字参数，默认走 cfg 与"今天上月"。
     """
     today = end_date or datetime.now(timezone.utc).date()
     last_y, last_m = _last_complete_month(today)
-    months = list(_month_iter(cfg.history_start_date, date(last_y, last_m, 1)))
+    start = start_date or cfg.history_start_date
+    months = list(_month_iter(start, date(last_y, last_m, 1)))
 
     cfg.symbol_dir.mkdir(parents=True, exist_ok=True)
     stats: dict[str, Any] = {"downloaded": 0, "skipped": 0, "failed": 0, "failed_list": []}
