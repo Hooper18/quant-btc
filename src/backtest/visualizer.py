@@ -327,6 +327,81 @@ class BacktestVisualizer:
             ax_hold.set_title("持仓时长（无数据）")
 
     # ---------- 一键导出 ----------
+    def plot_walk_forward(
+        self,
+        ax_eq: "plt.Axes",
+        ax_sharpe: "plt.Axes",
+        wf_result: Any,
+    ) -> None:
+        """Walk-Forward 双图：上拼接净值（按窗口着色），下窗口测试夏普柱状图。
+
+        ax_eq:  净值轴
+        ax_sharpe: 夏普柱状图轴
+        wf_result: WalkForwardResult（避免循环 import 用 Any）
+        """
+        windows = wf_result.windows
+        cmap = plt.cm.tab20
+        last_eq_value: float | None = None
+        for i, w in enumerate(windows):
+            color = cmap(i % 20)
+            # 在拼接序列里找该窗口的 ts 段
+            start_ts = w.test_start
+            end_ts = w.test_end
+            xs: list = []
+            ys: list = []
+            for ts, eq in zip(wf_result.combined_timestamps, wf_result.combined_equity):
+                if start_ts <= ts < end_ts:
+                    xs.append(ts)
+                    ys.append(eq)
+            if not xs:
+                continue
+            # 与上一窗口末尾连续：插入上一末尾值作为本段起点（视觉连续）
+            if last_eq_value is not None:
+                xs = [xs[0]] + xs
+                ys = [last_eq_value] + ys
+            ax_eq.plot(xs, ys, color=color, linewidth=1.1, label=f"W{w.index}")
+            last_eq_value = ys[-1]
+        # 初始资金参考线
+        if wf_result.combined_equity:
+            init_v = (
+                wf_result.combined_equity[0]
+                if wf_result.combined_equity else 100
+            )
+            # 使用首个窗口起始值
+            ax_eq.axhline(init_v, color="#888", linestyle="--", linewidth=0.6, alpha=0.6)
+        ax_eq.set_yscale("log")
+        ax_eq.set_title(
+            f"Walk-Forward 拼接净值（{'优化' if wf_result.optimized else '固定参数'}，"
+            f"{len(windows)} 窗口）"
+        )
+        ax_eq.set_ylabel("净值 (USDT, 对数轴)")
+        ax_eq.grid(True, alpha=0.3)
+        # 窗口太多时图例会爆屏；限定上限
+        if len(windows) <= 20:
+            ax_eq.legend(loc="upper left", fontsize=7, ncol=2)
+        ax_eq.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax_eq.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        for label in ax_eq.get_xticklabels():
+            label.set_rotation(30); label.set_ha("right")
+
+        # 夏普柱状图
+        labels = [f"W{w.index}" for w in windows]
+        sharpes = [float(w.test_metrics.get("sharpe_ratio", 0)) for w in windows]
+        bar_colors = [_COLOR_LONG if s >= 0.5 else (_COLOR_BTC if s >= 0 else _COLOR_SHORT) for s in sharpes]
+        ax_sharpe.bar(labels, sharpes, color=bar_colors, edgecolor="#0e1117", linewidth=0.4)
+        ax_sharpe.axhline(0.5, color="#9ba1a8", linestyle="--", linewidth=0.7, label="0.5 阈值")
+        ax_sharpe.axhline(0, color="#444", linewidth=0.5)
+        avg_sharpe = sum(sharpes) / len(sharpes) if sharpes else 0
+        summary_sharpe = float(wf_result.summary.get("sharpe_ratio", 0))
+        ax_sharpe.set_title(
+            f"各窗口测试期夏普（窗口均值 {avg_sharpe:.2f}，拼接汇总 {summary_sharpe:.2f}）"
+        )
+        ax_sharpe.set_ylabel("夏普")
+        ax_sharpe.legend(loc="upper right", fontsize=8)
+        ax_sharpe.grid(True, axis="y", alpha=0.3)
+        for tick in ax_sharpe.get_xticklabels():
+            tick.set_rotation(45); tick.set_ha("right"); tick.set_fontsize(7)
+
     def save_report(self, output_dir: str | Path) -> Path:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)

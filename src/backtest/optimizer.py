@@ -145,46 +145,42 @@ class StrategyOptimizer:
         finally:
             tmp_path.unlink(missing_ok=True)
 
-    # ---------- 主入口 ----------
-    def optimize(
+    # ---------- 单数据集网格搜索（公开，walk-forward 复用）----------
+    def grid_search(
         self,
+        data_dict: dict[str, pl.DataFrame],
         param_grid: dict[str, list[Any]],
         metric: str = "sharpe",
-        train_ratio: float = 0.7,
         funding_rate_df: pl.DataFrame | None = None,
         progress: bool = True,
-    ) -> OptimizeResult:
+        progress_prefix: str = "",
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """对单一 data_dict 跑全网格，返回 (best_params, all_rows)。
+        不做 train/test 切分；调用方决定喂入的数据范围。
+        """
         if metric not in _METRIC_KEYS:
             raise ValueError(f"未知 metric={metric}；可选 {list(_METRIC_KEYS)}")
         metric_key = _METRIC_KEYS[metric]
         larger_better = _LARGER_IS_BETTER[metric]
 
-        train_data, test_data, split_ts = self._split(train_ratio)
-        primary_tf = self.backtester.primary_tf
-        logger.info(
-            "数据切分 @ %s（训练集 %d bars / 测试集 %d bars）",
-            split_ts, train_data[primary_tf].height, test_data[primary_tf].height,
-        )
-
         keys = list(param_grid.keys())
         values = [param_grid[k] for k in keys]
         combos = list(itertools.product(*values))
         total = len(combos)
-        logger.info("参数组合数：%d（维度=%d）", total, len(keys))
 
         rows: list[dict[str, Any]] = []
         best_score: float | None = None
-        best_idx: int = -1
+        best_params: dict[str, Any] | None = None
 
         for i, combo in enumerate(combos, 1):
             params = dict(zip(keys, combo))
             try:
                 strat_yaml = self.make_strategy_yaml(params)
-                res = self._run(strat_yaml, train_data, funding_rate_df)
+                res = self._run(strat_yaml, data_dict, funding_rate_df)
             except Exception as e:
-                logger.exception("[%d/%d] 失败：%s", i, total, params)
+                logger.exception("%s[%d/%d] 失败：%s", progress_prefix, i, total, params)
                 if progress:
-                    print(f"[{i:3d}/{total}] FAILED: {e!s:.80s}")
+                    print(f"{progress_prefix}[{i:3d}/{total}] FAILED: {e!s:.80s}")
                 continue
 
             score = float(res.metrics.get(metric_key, 0))
@@ -207,23 +203,42 @@ class StrategyOptimizer:
             )
             if improved:
                 best_score = score
-                best_idx = len(rows) - 1
+                best_params = params
                 marker = " ★"
             else:
                 marker = ""
             if progress:
                 print(
-                    f"[{i:3d}/{total}] {metric}={score:+8.3f}  "
+                    f"{progress_prefix}[{i:3d}/{total}] {metric}={score:+8.3f}  "
                     f"best={best_score:+8.3f}{marker}  {params}"
                 )
 
-        if best_idx < 0:
+        if best_params is None:
             raise RuntimeError("所有参数组合都回测失败")
+        return best_params, rows
 
-        # 在测试集上验证最优参数
-        best_row = rows[best_idx]
-        best_params = {k: best_row[k] for k in keys}
-        logger.info("最优参数：%s（train %s=%.4f）", best_params, metric, best_score)
+    # ---------- 主入口（带 train/test 切分）----------
+    def optimize(
+        self,
+        param_grid: dict[str, list[Any]],
+        metric: str = "sharpe",
+        train_ratio: float = 0.7,
+        funding_rate_df: pl.DataFrame | None = None,
+        progress: bool = True,
+    ) -> OptimizeResult:
+        train_data, test_data, split_ts = self._split(train_ratio)
+        primary_tf = self.backtester.primary_tf
+        logger.info(
+            "数据切分 @ %s（训练集 %d bars / 测试集 %d bars）",
+            split_ts, train_data[primary_tf].height, test_data[primary_tf].height,
+        )
+        logger.info("参数组合数：%d（维度=%d）", len(list(itertools.product(*param_grid.values()))), len(param_grid))
+
+        best_params, rows = self.grid_search(
+            train_data, param_grid, metric=metric,
+            funding_rate_df=funding_rate_df, progress=progress,
+        )
+        logger.info("最优参数：%s", best_params)
         best_train = self._run(self.make_strategy_yaml(best_params), train_data, funding_rate_df)
         best_test = self._run(self.make_strategy_yaml(best_params), test_data, funding_rate_df)
 
