@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 环境变量
+.env
+
+# 数据 / 模型（不入库；锚定根目录，避免误伤 src/data 等）
+/data/
+/models/
+*.parquet
+
+# 系统
+.DS_Store
