@@ -79,6 +79,14 @@ class RuleEngine:
         self._memory: dict[str, dict[str, bool]] = {}
         # 已触发的 cross：strategy_name -> condition_path -> 最近触发的 source_bar_idx
         self._cross_fired: dict[str, dict[str, int]] = {}
+        # 性能缓存：把所有 timestamp 列预转 Python list（datetime 比较 ~ns），
+        # 配合每 TF 一个单调推进的 cursor，省掉每 bar 的 search_sorted。
+        # 假设：evaluate 按 ts 单调递增调用（Backtester 的 bar 循环符合此约定）。
+        self._ts_cache: dict[str, list[datetime]] = {
+            tf: df["timestamp"].to_list() for tf, df in self.data_dict.items()
+        }
+        self._col_cache: dict[tuple[str, str], list] = {}
+        self._cursors: dict[str, int] = {tf: -1 for tf in self.data_dict}
 
     # ---------- YAML 加载 ----------
     def load_rules(self, yaml_path: str | Path) -> None:
@@ -104,27 +112,40 @@ class RuleEngine:
             self._cross_fired.setdefault(item["name"], {})
         logger.info("加载策略 %d 条", len(self.strategies))
 
-    # ---------- 跨周期取值 ----------
-    def _row_idx_at(self, tf: str, ts: datetime) -> int | None:
-        """tf 中 timestamp <= ts 的最大行索引；找不到返回 None。"""
+    # ---------- 跨周期取值（缓存加速版）----------
+    def _col_list(self, tf: str, name: str) -> list:
+        key = (tf, name)
+        cached = self._col_cache.get(key)
+        if cached is not None:
+            return cached
         df = self.data_dict[tf]
-        ts_col = df["timestamp"]
-        # search_sorted side='right' 给出 > ts 的第一个；-1 即 <= ts 的最后一个
-        idx = ts_col.search_sorted(ts, side="right") - 1
-        if idx < 0:
-            return None
-        return int(idx)
+        if name not in df.columns:
+            raise KeyError(f"指标 {name} 不在 {tf} DataFrame 中（已有列：{df.columns[:6]}...）")
+        lst = df[name].to_list()
+        self._col_cache[key] = lst
+        return lst
+
+    def _row_idx_at(self, tf: str, ts: datetime) -> int | None:
+        """tf 中 timestamp <= ts 的最大行索引；单调推进 cursor，O(1) 摊销。"""
+        arr = self._ts_cache[tf]
+        cursor = self._cursors[tf]
+        n = len(arr)
+        while cursor + 1 < n and arr[cursor + 1] <= ts:
+            cursor += 1
+        self._cursors[tf] = cursor
+        return cursor if cursor >= 0 else None
 
     def _value(self, indicator: str, tf: str, ts: datetime, lag: int = 0) -> float | None:
         """tf 中 ts 对齐的指标值；lag>0 返回更早的 bar。"""
         idx = self._row_idx_at(tf, ts)
         if idx is None or idx - lag < 0:
             return None
-        df = self.data_dict[tf]
-        if indicator not in df.columns:
-            raise KeyError(f"指标 {indicator} 不在 {tf} DataFrame 中（已有列：{df.columns[:6]}...）")
-        v = df[indicator][idx - lag]
-        return None if v is None else float(v)
+        v = self._col_list(tf, indicator)[idx - lag]
+        if v is None:
+            return None
+        if isinstance(v, float) and v != v:  # NaN
+            return None
+        return float(v)
 
     # ---------- 条件求值 ----------
     def _resolve_reference(self, ref: Any, tf: str, ts: datetime, lag: int = 0) -> float | None:
@@ -227,9 +248,9 @@ class RuleEngine:
         """对主 TF 当前 row_index 的 K 线评估所有策略，返回触发信号（已仲裁冲突）。"""
         if row_index < 0 or row_index >= df.height:
             raise IndexError(f"row_index={row_index} 越界（height={df.height}）")
-        ts = df["timestamp"][row_index]
-        # 主 TF df 必须等于 data_dict[primary_tf]，否则跨 TF 对齐会错位
-        # 这里只做 ts 对齐，不强校验对象是否同一引用
+        # 用 primary_tf 缓存的 timestamp list 替代 Polars 随机访问（每 bar 省一次 ~50μs）
+        # 假设：传入的 df 与 data_dict[primary_tf] 一致；否则跨 TF 对齐会错位
+        ts = self._ts_cache[self.primary_tf][row_index]
 
         fired: list[Signal] = []
         for strat in self.strategies:
