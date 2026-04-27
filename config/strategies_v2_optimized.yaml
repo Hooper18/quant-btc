@@ -1,0 +1,42 @@
+# V2 最优参数（Task2 扩展搜索 + Walk-Forward 验证）
+# 由 scripts/optimize.py + 自定义 grid 在 6×2×2×3=72 组合中搜索得到
+# Walk-Forward (20 窗口) 汇总：
+#   总收益 1057% / 年化 63% / 夏普 2.27 / 最大回撤 21% / 胜率 58% / 810 笔交易
+# 对比 V1（RSI=70 size=5 SL=5 TP=6）的 WF 汇总：
+#   v1: 508% / 43% / 1.51 / 24% / 44% / 433 笔
+# → V2 在样本外评估中全面优于 V1（Phase 13 敏感度热力图判断正确）
+#
+# 配合 Task1 的 7× 杠杆建议（破产概率 < 5%）使用最佳
+
+strategies:
+  - name: "RSI超买做空"
+    conditions:
+      - indicator: rsi_14
+        operator: ">"
+        value: 55
+        timeframe: "1h"
+      - indicator: macd_histogram_12_26_9
+        operator: "<"
+        value: 0
+        timeframe: "1h"
+    logic: AND
+    action:
+      side: short
+      type: market
+      size_pct: 3
+    stop_loss_pct: 5
+    take_profit_pct: 4
+
+  - name: "MACD金叉做多"
+    conditions:
+      - indicator: macd_line_12_26_9
+        cross: above
+        reference: macd_signal_12_26_9
+        timeframe: "4h"
+    logic: AND
+    action:
+      side: long
+      type: market
+      size_pct: 10
+    stop_loss_pct: 2
+    take_profit_pct: 4
