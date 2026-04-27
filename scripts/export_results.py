@@ -1,19 +1,18 @@
 """把回测产物导出为前端可用的 JSON。
 
-所有 JSON 写入 web/public/data/，每个文件 < 500KB（曲线按天降采样，蒙特卡洛只存
-百分位）。本脚本可独立跑一次，也是 update_and_export.py 的核心步骤。
+主要变更（Phase 6）：
+- 遍历 config/strategies*.yaml 全部策略，逐个跑 BTC/ETH/SOL 回测
+- 每个策略生成 web/public/data/strategies/{id}.json（含规则描述、3 币种结果）
+- 生成 web/public/data/strategies_index.json 索引（前端排行榜/选择器用）
+- 兼容保留：BTCUSDT_*.json / ETHUSDT_*.json / SOLUSDT_*.json（v2_optimized 结果，
+  Risk 页/Dashboard 旧链路仍可工作）+ walk_forward / leverage / monte_carlo / sensitivity
 
 输出（路径相对项目根 web/public/data/）：
-    {symbol}_equity_curve.json     净值曲线（日采样，含价格双 Y 轴）
-    {symbol}_metrics.json          关键指标
-    {symbol}_trades.json           最近 100 笔交易
-    {symbol}_monthly_returns.json  月度收益率矩阵
-    walk_forward_summary.json      WF 20 窗口
-    leverage_scan.json             杠杆 × 破产概率
-    monte_carlo.json               MC 百分位
-    sensitivity.json               敏感度热力图（RSI×SL / RSI×TP / SL×TP，小网格）
-    portfolio.json                 组合回测（如已存在 portfolio 输出）
-    fear_greed_latest.json         最近 30 天恐慌指数
+    strategies/{id}.json            单策略详情（3 币种 metrics + equity + monthly + trades）
+    strategies_index.json           策略索引 + 排行用摘要
+    {symbol}_*.json                 兼容旧前端（v2_optimized 结果）
+    walk_forward_summary.json / leverage_scan.json / monte_carlo.json / sensitivity.json
+    portfolio.json / fear_greed_latest.json
 """
 from __future__ import annotations
 
@@ -49,9 +48,11 @@ from run_backtest import (  # noqa: E402
 )
 
 DATA_OUT = PROJECT_ROOT / "web" / "public" / "data"
-STRATEGY_PATH = PROJECT_ROOT / "config" / "strategies_v2_optimized.yaml"
+STRATEGY_DIR = DATA_OUT / "strategies"
+DEFAULT_BTC_STRATEGY = "strategies_v2_optimized.yaml"  # 用于兼容旧产物
 BACKTEST_CFG = PROJECT_ROOT / "config" / "backtest_config.yaml"
 DATA_CFG = PROJECT_ROOT / "config" / "data_config.yaml"
+DEFAULT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 
 def _setup_logging() -> None:
@@ -86,8 +87,7 @@ def _write_json(path: Path, payload: Any) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=_json_default)
     path.write_text(text, encoding="utf-8")
-    size = path.stat().st_size
-    return size
+    return path.stat().st_size
 
 
 def _json_default(obj: Any) -> Any:
@@ -104,58 +104,166 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"Unserializable: {type(obj)}")
 
 
-# ---------- 单币种回测 + 导出 ----------
+# ---------- 策略规则 → 自然语言 ----------
 
-def _run_symbol_backtest(
+_OP_ZH = {">": "＞", "<": "＜", ">=": "≥", "<=": "≤", "==": "＝", "!=": "≠"}
+_SIDE_ZH = {"long": "做多", "short": "做空"}
+_CROSS_ZH = {"above": "上穿", "below": "下穿"}
+
+
+def _describe_condition(c: dict[str, Any]) -> str:
+    if "conditions" in c:
+        # 嵌套
+        sub = " 且 " if c.get("logic", "AND") == "AND" else " 或 "
+        return "(" + sub.join(_describe_condition(s) for s in c["conditions"]) + ")"
+    ind = c.get("indicator", "?")
+    tf = c.get("timeframe")
+    tf_str = f"·{tf}" if tf else ""
+    if "cross" in c:
+        cross_zh = _CROSS_ZH.get(c["cross"], c["cross"])
+        return f"{ind}{tf_str} {cross_zh} {c.get('reference', '?')}"
+    if "from_above" in c and "to_below" in c:
+        return f"{ind}{tf_str} 从 ≥{c['from_above']} 跌破 {c['to_below']}"
+    if "from_below" in c and "to_above" in c:
+        return f"{ind}{tf_str} 从 ≤{c['from_below']} 突破 {c['to_above']}"
+    op = _OP_ZH.get(c.get("operator", ""), c.get("operator", "?"))
+    val = c.get("value", "?")
+    return f"{ind}{tf_str} {op} {val}"
+
+
+def _describe_strategies(strat_yaml: dict) -> tuple[str, list[dict]]:
+    """生成策略文字摘要 + 结构化条目列表。"""
+    items: list[dict] = []
+    lines: list[str] = []
+    for s in strat_yaml.get("strategies", []):
+        name = s.get("name", "?")
+        side = s.get("action", {}).get("side", "?")
+        size_pct = s.get("action", {}).get("size_pct", "?")
+        sl = s.get("stop_loss_pct", "?")
+        tp = s.get("take_profit_pct", "?")
+        conds = [_describe_condition(c) for c in s.get("conditions", [])]
+        joiner = " 且 " if s.get("logic", "AND") == "AND" else " 或 "
+        cond_str = joiner.join(conds) if conds else "—"
+        side_zh = _SIDE_ZH.get(side, side)
+        line = f"{name}：当 {cond_str} → {side_zh}（仓位 {size_pct}% · 止损 {sl}% · 止盈 {tp}%）"
+        lines.append(line)
+        items.append({
+            "name": name,
+            "side": side,
+            "side_zh": side_zh,
+            "conditions_text": cond_str,
+            "size_pct": size_pct,
+            "stop_loss_pct": sl,
+            "take_profit_pct": tp,
+        })
+    return "\n".join(lines), items
+
+
+# 文件名 → 策略类型默认标签 + 友好显示名
+_STRATEGY_META: dict[str, dict[str, Any]] = {
+    "strategies_v2_optimized": {
+        "display_name": "V2 最优参数（RSI+MACD）",
+        "tags": ["RSI超买", "MACD趋势", "最优参数", "BTC专用"],
+        "category": "复合趋势",
+    },
+    "strategies": {
+        "display_name": "经典 RSI+MACD 基础版",
+        "tags": ["RSI超买", "MACD趋势", "基础版"],
+        "category": "复合趋势",
+    },
+    "strategies_trend_follow": {
+        "display_name": "EMA 交叉趋势跟踪",
+        "tags": ["趋势跟踪", "EMA交叉", "ADX 过滤"],
+        "category": "趋势跟踪",
+    },
+    "strategies_mean_reversion": {
+        "display_name": "极端均值回归",
+        "tags": ["均值回归", "RSI(6)", "布林带"],
+        "category": "均值回归",
+    },
+    "strategies_bollinger_squeeze": {
+        "display_name": "布林通道突破",
+        "tags": ["布林带突破", "趋势跟踪", "ADX 过滤"],
+        "category": "波动率突破",
+    },
+    "strategies_enhanced_rsi": {
+        "display_name": "增强 RSI（情绪+主动盘）",
+        "tags": ["RSI超买", "市场情绪", "主动盘比例"],
+        "category": "情绪反向",
+    },
+    "strategies_multi_signal": {
+        "display_name": "多周期复合信号",
+        "tags": ["EMA交叉", "RSI", "MACD", "多周期"],
+        "category": "动量策略",
+    },
+    "strategies_oi_divergence": {
+        "display_name": "OI 持仓量背离",
+        "tags": ["持仓量背离", "新高新低"],
+        "category": "持仓量背离",
+    },
+    "strategies_rsi_divergence": {
+        "display_name": "RSI 极值回归",
+        "tags": ["RSI背离", "动量耗尽"],
+        "category": "RSI 背离",
+    },
+    "strategies_sentiment": {
+        "display_name": "市场情绪反向",
+        "tags": ["市场情绪", "FNG", "多空比"],
+        "category": "情绪反向",
+    },
+}
+
+
+def _strategy_meta(stem: str) -> dict[str, Any]:
+    return _STRATEGY_META.get(stem, {
+        "display_name": stem,
+        "tags": [],
+        "category": "未分类",
+    })
+
+
+# ---------- 单次 (策略, 币种) 回测 ----------
+
+def _run_one(
     symbol: str, strat_yaml: dict, backtester: Backtester
 ) -> tuple[Any, pl.DataFrame] | None:
     data_cfg = DataConfig.from_yaml(DATA_CFG).for_symbol(symbol)
     if not _has_data(symbol, backtester.primary_tf):
-        logging.warning("跳过 %s：缺 %s parquet", symbol, backtester.primary_tf)
         return None
-
     used_tfs = _used_timeframes(strat_yaml["strategies"], backtester.primary_tf)
     ind_cfg = _collect_required_indicators(strat_yaml["strategies"])
-
-    # ETH/SOL 没有 funding/OI/FNG 辅助数据 — 静默缺失
     aux = load_aux_data(data_cfg)
-
     try:
         data_dict = build_data_dict(data_cfg, used_tfs, ind_cfg, aux=aux)
-    except FileNotFoundError as e:
-        logging.warning("跳过 %s：%s", symbol, e)
+    except (FileNotFoundError, KeyError) as e:
+        logging.warning("跳过 %s × %s：%s", symbol, strat_yaml.get("_filename", "?"), e)
         return None
 
     tmp = Path(tempfile.gettempdir()) / f"strat_{uuid.uuid4().hex}.yaml"
-    tmp.write_text(yaml.safe_dump(strat_yaml, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    payload = {k: v for k, v in strat_yaml.items() if not k.startswith("_")}
+    tmp.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
     try:
         result = backtester.run(data_dict, str(tmp), funding_rate_df=aux.get("funding"))
+    except Exception as e:
+        logging.warning("回测失败 %s × %s: %s", symbol, strat_yaml.get("_filename", "?"), e)
+        return None
     finally:
         tmp.unlink(missing_ok=True)
-
     return result, data_dict[backtester.primary_tf]
 
 
-def _export_equity_curve(symbol: str, result: Any, primary_df: pl.DataFrame) -> int:
-    """导出按日采样的净值 + BTC 价格序列。"""
-    timestamps = result.timestamps
-    equity = result.equity_curve
-    if not timestamps:
-        return 0
-
-    # 价格序列：从主 TF dataframe 抽 close
+def _equity_daily(result: Any, primary_df: pl.DataFrame) -> list[dict]:
+    if not result.timestamps:
+        return []
     price_lookup: dict[datetime, float] = {}
     for ts, close in zip(primary_df["timestamp"].to_list(), primary_df["close"].to_list()):
         price_lookup[ts] = float(close)
-
-    # 按 UTC 日聚合（保留每日最后一个点）
     daily: dict[date, tuple[datetime, float, float]] = {}
-    for ts, eq in zip(timestamps, equity):
+    for ts, eq in zip(result.timestamps, result.equity_curve):
         d = ts.date()
         price = price_lookup.get(ts, float("nan"))
         daily[d] = (ts, float(eq), price)
-
-    pts = [
+    return [
         {
             "t": ts.strftime("%Y-%m-%d"),
             "nav": round(eq, 2),
@@ -164,13 +272,21 @@ def _export_equity_curve(symbol: str, result: Any, primary_df: pl.DataFrame) -> 
         for d in sorted(daily)
         for ts, eq, price in [daily[d]]
     ]
-    return _write_json(DATA_OUT / f"{symbol}_equity_curve.json", {"symbol": symbol, "points": pts})
 
 
-def _export_metrics(symbol: str, result: Any) -> int:
+def _equity_sparkline(equity_pts: list[dict], n: int = 60) -> list[float]:
+    """采样到约 n 个点用于排行榜的迷你图。"""
+    if not equity_pts:
+        return []
+    if len(equity_pts) <= n:
+        return [p["nav"] for p in equity_pts]
+    step = len(equity_pts) / n
+    return [round(equity_pts[int(i * step)]["nav"], 2) for i in range(n)]
+
+
+def _metrics_payload(result: Any) -> dict[str, Any]:
     m = result.metrics
-    payload = {
-        "symbol": symbol,
+    return {
         "initial_balance": round(m.get("initial_balance", 0), 2),
         "final_equity": round(m.get("final_equity", 0), 2),
         "total_return_pct": round(m.get("total_return_pct", 0), 2),
@@ -183,10 +299,9 @@ def _export_metrics(symbol: str, result: Any) -> int:
         "avg_holding_hours": round(m.get("avg_holding_hours", 0), 2),
         "circuit_breaker": int(m.get("circuit_breaker", 0)),
     }
-    return _write_json(DATA_OUT / f"{symbol}_metrics.json", payload)
 
 
-def _export_trades(symbol: str, result: Any, limit: int = 100) -> int:
+def _trades_payload(result: Any, limit: int = 100) -> dict[str, Any]:
     closed = [t for t in result.trades if t.side.endswith("_close") or t.side == "liquidate"]
     last = closed[-limit:]
     rows = [
@@ -201,25 +316,17 @@ def _export_trades(symbol: str, result: Any, limit: int = 100) -> int:
         }
         for t in last
     ]
-    return _write_json(
-        DATA_OUT / f"{symbol}_trades.json",
-        {"symbol": symbol, "total_closed": len(closed), "shown": len(rows), "rows": rows},
-    )
+    return {"total_closed": len(closed), "shown": len(rows), "rows": rows}
 
 
-def _export_monthly_returns(symbol: str, result: Any) -> int:
-    """从 equity 曲线抽月初/月末点，算月度收益率，导出年×月矩阵。"""
+def _monthly_matrix(result: Any) -> list[dict]:
     if not result.timestamps:
-        return 0
-
-    # 按 (year, month) 取每月最后一点
+        return []
     month_last: dict[tuple[int, int], float] = {}
     for ts, eq in zip(result.timestamps, result.equity_curve):
         month_last[(ts.year, ts.month)] = float(eq)
     if not month_last:
-        return 0
-
-    # 按时间排序
+        return []
     keys = sorted(month_last)
     initial = result.metrics.get("initial_balance", 100.0)
     prev = float(initial)
@@ -229,16 +336,169 @@ def _export_monthly_returns(symbol: str, result: Any) -> int:
         ret = (cur - prev) / prev * 100.0 if prev > 0 else 0.0
         rows.setdefault(y, {})[m] = round(ret, 2)
         prev = cur
-
-    matrix = [
+    return [
         {"year": y, "months": [rows.get(y, {}).get(mm) for mm in range(1, 13)]}
         for y in sorted(rows)
     ]
-    return _write_json(DATA_OUT / f"{symbol}_monthly_returns.json", {"symbol": symbol, "matrix": matrix})
 
+
+# ---------- 单策略导出 ----------
+
+def _export_one_strategy(
+    yaml_path: Path, backtester: Backtester, symbols: tuple[str, ...] = DEFAULT_SYMBOLS
+) -> dict[str, Any] | None:
+    """跑 (yaml × 全币种) 回测，写 strategies/{id}.json，返回索引摘要。"""
+    with open(yaml_path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if "strategies" not in raw or not raw["strategies"]:
+        logging.warning("跳过 %s：无 strategies 字段", yaml_path.name)
+        return None
+    raw["_filename"] = yaml_path.name
+    stem = yaml_path.stem
+    meta = _strategy_meta(stem)
+    rules_text, rule_items = _describe_strategies(raw)
+
+    log = logging.getLogger("export_strategy")
+    log.info("===== %s (%s) =====", stem, meta["display_name"])
+
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for symbol in symbols:
+        out = _run_one(symbol, raw, backtester)
+        if out is None:
+            continue
+        result, primary_df = out
+        equity_pts = _equity_daily(result, primary_df)
+        metrics = _metrics_payload(result)
+        log.info(
+            "  %s: 收益=%.2f%% 夏普=%.2f 回撤=%.2f%% 胜率=%.2f%% 笔数=%d",
+            symbol, metrics["total_return_pct"], metrics["sharpe_ratio"],
+            metrics["max_drawdown_pct"], metrics["win_rate_pct"], metrics["total_trades"],
+        )
+        by_symbol[symbol] = {
+            "metrics": metrics,
+            "equity_points": equity_pts,
+            "sparkline": _equity_sparkline(equity_pts, n=60),
+            "monthly_matrix": _monthly_matrix(result),
+            "trades": _trades_payload(result, limit=100),
+        }
+
+    if not by_symbol:
+        logging.warning("策略 %s 无任何币种成功 → 跳过导出", stem)
+        return None
+
+    default_symbol = "BTCUSDT" if "BTCUSDT" in by_symbol else next(iter(by_symbol))
+    payload = {
+        "id": stem,
+        "file": yaml_path.name,
+        "display_name": meta["display_name"],
+        "category": meta["category"],
+        "tags": meta["tags"],
+        "rules_text": rules_text,
+        "rule_items": rule_items,
+        "applicable_symbols": list(by_symbol.keys()),
+        "default_symbol": default_symbol,
+        "by_symbol": by_symbol,
+    }
+    size = _write_json(STRATEGY_DIR / f"{stem}.json", payload)
+    log.info("  → 写出 strategies/%s.json (%.1f KB)", stem, size / 1024)
+
+    # 给索引提供基于"默认币种"的关键指标
+    primary = by_symbol[default_symbol]["metrics"]
+    return {
+        "id": stem,
+        "file": yaml_path.name,
+        "display_name": meta["display_name"],
+        "category": meta["category"],
+        "tags": meta["tags"],
+        "rules_text": rules_text,
+        "default_symbol": default_symbol,
+        "applicable_symbols": list(by_symbol.keys()),
+        "metrics": {
+            sym: by_symbol[sym]["metrics"] for sym in by_symbol
+        },
+        "primary": primary,
+        "sparkline": by_symbol[default_symbol]["sparkline"],
+    }
+
+
+def _normalize(values: list[float], inverse: bool = False) -> list[float]:
+    """min-max 归一化到 [0,1]；inverse=True 时 1 表示越小越好。"""
+    if not values:
+        return []
+    lo = min(values)
+    hi = max(values)
+    span = hi - lo
+    if span == 0:
+        return [0.5] * len(values)
+    out = [(v - lo) / span for v in values]
+    if inverse:
+        out = [1 - x for x in out]
+    return out
+
+
+def _build_index(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """生成 strategies_index.json，含综合评分。"""
+    sharpes = [r["primary"]["sharpe_ratio"] for r in rows]
+    annualized = [r["primary"]["annualized_return_pct"] for r in rows]
+    drawdowns = [r["primary"]["max_drawdown_pct"] for r in rows]
+    winrates = [r["primary"]["win_rate_pct"] for r in rows]
+
+    n_sharpe = _normalize(sharpes)
+    n_ann = _normalize(annualized)
+    n_dd = _normalize(drawdowns, inverse=True)  # 回撤越小越好
+    n_win = _normalize(winrates)
+
+    for i, r in enumerate(rows):
+        composite = (
+            0.3 * n_sharpe[i] + 0.3 * n_ann[i] + 0.2 * n_dd[i] + 0.2 * n_win[i]
+        )
+        r["composite_score"] = round(composite * 100, 2)
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "weights": {"sharpe": 0.3, "annualized": 0.3, "max_drawdown_inv": 0.2, "win_rate": 0.2},
+        "count": len(rows),
+        "strategies": rows,
+    }
+
+
+# ---------- 兼容旧前端：导出 v2_optimized 的 BTC 多币种文件 ----------
+
+def _legacy_per_symbol_exports(
+    rows: list[dict[str, Any]], backtester: Backtester
+) -> dict[str, int]:
+    """复用 v2_optimized 的 by_symbol 数据写出 {symbol}_*.json 兼容文件。"""
+    sizes: dict[str, int] = {}
+    target = next((r for r in rows if r["id"] == "strategies_v2_optimized"), None)
+    if target is None:
+        target = max(rows, key=lambda r: r["primary"]["sharpe_ratio"])
+    detail_path = STRATEGY_DIR / f"{target['id']}.json"
+    if not detail_path.exists():
+        return sizes
+    detail = json.loads(detail_path.read_text(encoding="utf-8"))
+    for symbol, blob in detail["by_symbol"].items():
+        m = blob["metrics"]
+        sizes[f"{symbol}_metrics.json"] = _write_json(
+            DATA_OUT / f"{symbol}_metrics.json", {"symbol": symbol, **m}
+        )
+        sizes[f"{symbol}_equity_curve.json"] = _write_json(
+            DATA_OUT / f"{symbol}_equity_curve.json",
+            {"symbol": symbol, "points": blob["equity_points"]},
+        )
+        sizes[f"{symbol}_trades.json"] = _write_json(
+            DATA_OUT / f"{symbol}_trades.json",
+            {"symbol": symbol, **blob["trades"]},
+        )
+        sizes[f"{symbol}_monthly_returns.json"] = _write_json(
+            DATA_OUT / f"{symbol}_monthly_returns.json",
+            {"symbol": symbol, "matrix": blob["monthly_matrix"]},
+        )
+    return sizes
+
+
+# ---------- 衍生：MC / WF / 杠杆 / 敏感度 / portfolio / FNG（保留 BTC v2 链路）----------
 
 def _export_monte_carlo(symbol: str, result: Any) -> int:
-    """对 BTC 主回测做 1000 次 bootstrap MC，导出百分位。"""
     sim = MonteCarloSimulator(result)
     mc = sim.run(n_simulations=1000, seed=42)
     qs = (5, 25, 50, 75, 95)
@@ -252,7 +512,6 @@ def _export_monte_carlo(symbol: str, result: Any) -> int:
         "max_dd_pct_percentiles": {str(q): round(mc.percentiles(mc.max_drawdowns_pct, [q])[q], 2) for q in qs},
         "return_pct_mean": round(float(np.mean(mc.final_returns_pct)), 2),
         "max_dd_pct_mean": round(float(np.mean(mc.max_drawdowns_pct)), 2),
-        # 直方图分桶（避免存全部 1000 条）
         "return_histogram": _histogram(mc.final_returns_pct, bins=30),
         "max_dd_histogram": _histogram(mc.max_drawdowns_pct, bins=30),
     }
@@ -267,27 +526,20 @@ def _histogram(arr: np.ndarray, bins: int = 30) -> dict[str, list[float]]:
     }
 
 
-# ---------- 外部产物聚合 ----------
-
 def _export_walk_forward() -> int:
-    """从 output/walk_forward_*_opt/ 读 windows.csv 与 report.txt 汇总。"""
     candidates = sorted((PROJECT_ROOT / "output").glob("walk_forward_*_opt"))
     if not candidates:
         candidates = sorted((PROJECT_ROOT / "output").glob("walk_forward_*"))
     if not candidates:
         logging.warning("跳过 walk_forward：找不到 output/walk_forward_*")
         return 0
-
     src = candidates[-1]
     csv_path = src / "windows.csv"
     if not csv_path.exists():
-        logging.warning("跳过 walk_forward：%s 不存在", csv_path)
         return 0
-
     windows: list[dict[str, Any]] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
+        for r in csv.DictReader(f):
             windows.append({
                 "window": int(r["window"]),
                 "train_start": r["train_start"],
@@ -302,8 +554,6 @@ def _export_walk_forward() -> int:
                 "test_win_rate_pct": round(float(r["test_win_rate_pct"]), 2),
                 "test_total_trades": int(float(r["test_total_trades"])),
             })
-
-    # 从 report.txt 抽汇总
     summary: dict[str, Any] = {}
     rpt = (src / "report.txt").read_text(encoding="utf-8") if (src / "report.txt").exists() else ""
     for key, pat in [
@@ -319,7 +569,6 @@ def _export_walk_forward() -> int:
         if m:
             v = m.group(1)
             summary[key] = int(v) if key in ("total_trades", "n_windows") else float(v)
-
     return _write_json(
         DATA_OUT / "walk_forward_summary.json",
         {"source": src.name, "summary": summary, "windows": windows},
@@ -330,9 +579,7 @@ def _export_leverage_scan() -> int:
     src = PROJECT_ROOT / "output" / "leverage_scan"
     csv_path = src / "table.csv"
     if not csv_path.exists():
-        logging.warning("跳过 leverage_scan：%s 不存在", csv_path)
         return 0
-
     rows: list[dict[str, Any]] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
@@ -345,14 +592,11 @@ def _export_leverage_scan() -> int:
                 "total_trades": int(r["total_trades"]),
                 "ruin_probability": round(float(r["ruin_probability"]), 4),
             })
-
-    # 从 report.txt 抽建议
     rec = ""
     rpt = (src / "report.txt").read_text(encoding="utf-8") if (src / "report.txt").exists() else ""
     m = re.search(r"建议生产用\s*(\d+)×", rpt)
     if m:
         rec = m.group(1)
-
     return _write_json(
         DATA_OUT / "leverage_scan.json",
         {"recommended_leverage": int(rec) if rec else None, "rows": rows},
@@ -360,11 +604,9 @@ def _export_leverage_scan() -> int:
 
 
 def _export_sensitivity(strat_yaml: dict, backtester: Backtester) -> int:
-    """对 BTC 跑小尺寸敏感度热力图（4-5×4-5 格）。"""
     data_cfg = DataConfig.from_yaml(DATA_CFG).for_symbol("BTCUSDT")
     if not _has_data("BTCUSDT", backtester.primary_tf):
         return 0
-
     used_tfs = _used_timeframes(strat_yaml["strategies"], backtester.primary_tf)
     ind_cfg = _collect_required_indicators(strat_yaml["strategies"])
     aux = load_aux_data(data_cfg)
@@ -388,7 +630,7 @@ def _export_sensitivity(strat_yaml: dict, backtester: Backtester) -> int:
                        ("strategies[0].action.size_pct",     "仓位%",     [2, 3, 5, 7, 10])),
     ]
 
-    def _run_one(yaml_cfg: dict) -> float:
+    def _run_one_inner(yaml_cfg: dict) -> float:
         tmp = Path(tempfile.gettempdir()) / f"sens_{uuid.uuid4().hex}.yaml"
         tmp.write_text(yaml.safe_dump(yaml_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
         try:
@@ -413,7 +655,7 @@ def _export_sensitivity(strat_yaml: dict, backtester: Backtester) -> int:
                     set_param(mod, path, val)
                 set_param(mod, p1_path, v1)
                 set_param(mod, p2_path, v2)
-                sharpe = _run_one(mod)
+                sharpe = _run_one_inner(mod)
                 matrix[i][j] = round(sharpe, 3) if not np.isnan(sharpe) else None
                 logging.info("[sens %s %d/%d] %s=%s × %s=%s → sharpe=%.3f",
                              name, cnt, total_runs, p1_label, v1, p2_label, v2,
@@ -438,14 +680,10 @@ def _export_sensitivity(strat_yaml: dict, backtester: Backtester) -> int:
 def _export_portfolio() -> int:
     candidates = sorted((PROJECT_ROOT / "output").glob("portfolio_*"))
     if not candidates:
-        logging.warning("跳过 portfolio：找不到 output/portfolio_*")
         return 0
     src = candidates[-1]
     summary_txt = (src / "summary.txt").read_text(encoding="utf-8") if (src / "summary.txt").exists() else ""
-
     payload: dict[str, Any] = {"source": src.name, "summary": {}, "sleeves": [], "equity": []}
-
-    # 抽组合指标
     for key, pat in [
         ("initial_balance", r"总本金:\s*([0-9.]+)"),
         ("final_equity", r"期末权益:\s*([0-9.]+)"),
@@ -457,8 +695,6 @@ def _export_portfolio() -> int:
         m = re.search(pat, summary_txt)
         if m:
             payload["summary"][key] = float(m.group(1))
-
-    # 抽各 sleeve
     for line in summary_txt.splitlines():
         m = re.match(
             r"\s*(\w+)\s+alloc=([\d.]+)%\s+start=([\d.]+)\s+→\s+end=([\d.]+)\s+\(\+([\d.]+)%\)\s+sharpe=([\d.\-]+)\s+MDD=([\d.]+)%\s+trades=(\d+)",
@@ -475,8 +711,6 @@ def _export_portfolio() -> int:
                 "max_drawdown_pct": float(m.group(7)),
                 "total_trades": int(m.group(8)),
             })
-
-    # equity 曲线（按天采样）
     eq_csv = src / "equity.csv"
     if eq_csv.exists():
         last_per_day: dict[str, float] = {}
@@ -487,14 +721,12 @@ def _export_portfolio() -> int:
         payload["equity"] = [
             {"t": d, "v": round(v, 2)} for d, v in sorted(last_per_day.items())
         ]
-
     return _write_json(DATA_OUT / "portfolio.json", payload)
 
 
 def _export_fear_greed() -> int:
     fng_path = PROJECT_ROOT / "data" / "parquet" / "BTCUSDT" / "fear_greed_index.parquet"
     if not fng_path.exists():
-        logging.warning("跳过 fear_greed：%s 不存在", fng_path)
         return 0
     df = pl.read_parquet(fng_path).sort("timestamp").tail(30)
     rows = [
@@ -511,64 +743,92 @@ def _export_fear_greed() -> int:
 # ---------- 主入口 ----------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="导出回测结果为 JSON")
+    parser = argparse.ArgumentParser(description="导出回测结果为 JSON（多策略）")
     parser.add_argument("--skip-sensitivity", action="store_true",
                         help="跳过敏感度热力图（贵，约 100 次回测）")
-    parser.add_argument("--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+    parser.add_argument("--symbols", nargs="+", default=list(DEFAULT_SYMBOLS))
+    parser.add_argument("--only", nargs="+", default=None,
+                        help="只跑指定 stem（不带 .yaml 扩展）；调试用")
     args = parser.parse_args()
 
     _setup_logging()
     log = logging.getLogger("export_results")
 
     DATA_OUT.mkdir(parents=True, exist_ok=True)
-
-    with open(STRATEGY_PATH, encoding="utf-8") as f:
-        strat_yaml = yaml.safe_load(f) or {}
+    STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
 
     bt = Backtester.from_yaml(str(BACKTEST_CFG))
 
-    sizes: dict[str, int] = {}
-    btc_result = None
-
-    for symbol in args.symbols:
-        log.info("===== 跑 %s 回测 =====", symbol)
-        out = _run_symbol_backtest(symbol, strat_yaml, bt)
-        if out is None:
+    # 发现所有策略 yaml（排除非策略 yaml）
+    yaml_files: list[Path] = []
+    for p in sorted((PROJECT_ROOT / "config").glob("strategies*.yaml")):
+        if args.only and p.stem not in args.only:
             continue
-        result, primary_df = out
-        log.info("%s: 总收益=%.2f%% 夏普=%.2f 交易=%d",
-                 symbol, result.metrics.get("total_return_pct", 0),
-                 result.metrics.get("sharpe_ratio", 0),
-                 int(result.metrics.get("total_trades", 0)))
+        yaml_files.append(p)
+    log.info("发现策略文件 %d 个：%s", len(yaml_files), [f.name for f in yaml_files])
 
-        sizes[f"{symbol}_equity_curve.json"] = _export_equity_curve(symbol, result, primary_df)
-        sizes[f"{symbol}_metrics.json"] = _export_metrics(symbol, result)
-        sizes[f"{symbol}_trades.json"] = _export_trades(symbol, result)
-        sizes[f"{symbol}_monthly_returns.json"] = _export_monthly_returns(symbol, result)
+    # 跑每个策略
+    rows: list[dict[str, Any]] = []
+    for p in yaml_files:
+        summary = _export_one_strategy(p, bt, tuple(args.symbols))
+        if summary:
+            rows.append(summary)
 
-        if symbol == "BTCUSDT":
-            btc_result = result
+    if not rows:
+        log.error("无成功导出的策略 → 退出")
+        return 1
 
-    # BTC 衍生：Monte Carlo
+    # 排行榜索引（含综合评分）
+    index = _build_index(rows)
+    idx_size = _write_json(DATA_OUT / "strategies_index.json", index)
+    log.info("strategies_index.json 已写入 (%.1f KB)", idx_size / 1024)
+
+    # 兼容旧前端：以 v2_optimized 结果生成 {symbol}_*.json
+    legacy_sizes = _legacy_per_symbol_exports(rows, bt)
+
+    # MC：用 BTC v2_optimized 结果。需要重跑一次拿到 result 对象（json 不能反序列化 Backtester result）
+    btc_result = None
+    v2_path = PROJECT_ROOT / "config" / DEFAULT_BTC_STRATEGY
+    if v2_path.exists():
+        with open(v2_path, encoding="utf-8") as f:
+            v2_yaml = yaml.safe_load(f) or {}
+            v2_yaml["_filename"] = v2_path.name
+        out = _run_one("BTCUSDT", v2_yaml, bt)
+        if out is not None:
+            btc_result = out[0]
+
+    other_sizes: dict[str, int] = {}
     if btc_result is not None:
-        sizes["monte_carlo.json"] = _export_monte_carlo("BTCUSDT", btc_result)
+        other_sizes["monte_carlo.json"] = _export_monte_carlo("BTCUSDT", btc_result)
+    other_sizes["walk_forward_summary.json"] = _export_walk_forward()
+    other_sizes["leverage_scan.json"] = _export_leverage_scan()
+    other_sizes["portfolio.json"] = _export_portfolio()
+    other_sizes["fear_greed_latest.json"] = _export_fear_greed()
 
-    # 外部产物聚合
-    sizes["walk_forward_summary.json"] = _export_walk_forward()
-    sizes["leverage_scan.json"] = _export_leverage_scan()
-    sizes["portfolio.json"] = _export_portfolio()
-    sizes["fear_greed_latest.json"] = _export_fear_greed()
-
-    if not args.skip_sensitivity:
+    if not args.skip_sensitivity and v2_path.exists():
         log.info("===== 敏感度热力图（5×5×4 ≈ 100 次回测，慢）=====")
-        sizes["sensitivity.json"] = _export_sensitivity(strat_yaml, bt)
+        with open(v2_path, encoding="utf-8") as f:
+            v2_yaml = yaml.safe_load(f) or {}
+        other_sizes["sensitivity.json"] = _export_sensitivity(v2_yaml, bt)
 
-    print("\n========== JSON 导出汇总 ==========")
+    # 打印排行榜 top3
+    print("\n========== 综合评分 Top 5 ==========")
+    for r in sorted(rows, key=lambda x: x["composite_score"], reverse=True)[:5]:
+        print(f"  {r['composite_score']:6.2f}  {r['display_name']:32s}  "
+              f"sharpe={r['primary']['sharpe_ratio']:.2f}  "
+              f"年化={r['primary']['annualized_return_pct']:.1f}%  "
+              f"回撤={r['primary']['max_drawdown_pct']:.1f}%  "
+              f"胜率={r['primary']['win_rate_pct']:.1f}%")
+    print()
+
+    print("========== JSON 导出汇总 ==========")
     print(f"输出目录: {DATA_OUT}")
-    for name, size in sorted(sizes.items()):
+    all_sizes = {**legacy_sizes, **other_sizes, "strategies_index.json": idx_size}
+    for name, size in sorted(all_sizes.items()):
         kb = size / 1024
         flag = " ⚠ >500KB" if size > 500 * 1024 else ""
         print(f"  {name:40s} {kb:8.1f} KB{flag}")
+    print(f"  strategies/ × {len(rows)} files")
     print("=" * 38)
     return 0
 

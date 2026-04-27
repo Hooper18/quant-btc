@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './components/Layout'
 import Dashboard from './pages/Dashboard'
+import Rankings from './pages/Rankings'
 import Backtest from './pages/Backtest'
 import RiskAnalysis from './pages/RiskAnalysis'
 import MarketData from './pages/MarketData'
@@ -11,6 +12,7 @@ export default function App() {
     <Routes>
       <Route element={<Layout />}>
         <Route path="/" element={<Dashboard />} />
+        <Route path="/rankings" element={<Rankings />} />
         <Route path="/backtest" element={<Backtest />} />
         <Route path="/risk" element={<RiskAnalysis />} />
         <Route path="/market" element={<MarketData />} />

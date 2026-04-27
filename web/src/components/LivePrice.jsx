@@ -1,19 +1,21 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 const LABELS = { BTCUSDT: 'BTC', ETHUSDT: 'ETH', SOLUSDT: 'SOL' }
 
-// 单一 WS 复用：连接合并 stream，分发到各订阅者
-const SOCKET_URL = (symbols) =>
-  `wss://stream.binance.com:9443/stream?streams=${symbols
-    .map((s) => `${s.toLowerCase()}@ticker`)
-    .join('/')}`
+// 固定订阅 BTC/ETH/SOL 三路 ticker — 任意组件 useTicker 时复用同一连接，
+// 避免"先 mount 的单币种把 WS 锁死，后挂载的拿不到数据"的问题。
+const ALL_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+const STREAM_URL = `wss://stream.binance.com:9443/stream?streams=${ALL_SYMBOLS
+  .map((s) => `${s.toLowerCase()}@ticker`)
+  .join('/')}`
 
 let ws = null
 let listeners = new Set()
+let lastSnapshot = {}
 
-function ensureWs(symbols) {
+function ensureWs() {
   if (ws && (ws.readyState === 0 || ws.readyState === 1)) return ws
-  ws = new WebSocket(SOCKET_URL(symbols))
+  ws = new WebSocket(STREAM_URL)
   ws.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data)
@@ -28,6 +30,7 @@ function ensureWs(symbols) {
         low: parseFloat(d.l),
         volume: parseFloat(d.q),
       }
+      lastSnapshot[update.symbol] = update
       listeners.forEach((fn) => fn(update))
     } catch {
       /* ignore */
@@ -35,29 +38,32 @@ function ensureWs(symbols) {
   }
   ws.onclose = () => {
     ws = null
-    setTimeout(() => ensureWs(symbols), 3000)
+    setTimeout(() => ensureWs(), 3000)
+  }
+  ws.onerror = () => {
+    try { ws && ws.close() } catch { /* ignore */ }
   }
   return ws
 }
 
-export function useTicker(symbols) {
-  const [tickers, setTickers] = useState({})
-  const symRef = useRef(symbols.join(','))
+export function useTicker(_symbols) {
+  const [tickers, setTickers] = useState(() => ({ ...lastSnapshot }))
   useEffect(() => {
-    symRef.current = symbols.join(',')
-    ensureWs(symbols)
+    ensureWs()
+    if (Object.keys(lastSnapshot).length) {
+      setTickers({ ...lastSnapshot })
+    }
     const fn = (update) => {
       setTickers((prev) => ({ ...prev, [update.symbol]: update }))
     }
     listeners.add(fn)
     return () => { listeners.delete(fn) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symRef.current])
+  }, [])
   return tickers
 }
 
 export default function LivePrice({ symbol, size = 'lg' }) {
-  const tickers = useTicker([symbol])
+  const tickers = useTicker(ALL_SYMBOLS)
   const t = tickers[symbol]
 
   const containerCls = size === 'lg'
