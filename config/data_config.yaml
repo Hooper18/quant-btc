@@ -1,9 +1,22 @@
 # BTC/USDT 永续合约数据管道配置
+# Phase 后续：扩展到多币种。symbol 仍保留作为 BTC 主目录的兼容字段；
+# symbols 为多币种全集（download_all 遍历）。每个币种可选自定义起点。
 symbol: "BTCUSDT"
+symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 timeframes: ["1m", "5m", "15m", "1h", "4h", "1d"]
 
-# 历史下载起点
+# 历史下载起点（默认）
 history_start_date: "2020-01-01"
+
+# 各币种自定义配置：覆盖默认 history_start_date / timeframes
+# BTC 维持全量；ETH/SOL 只下 1h/4h，从 2024-01 起（2 年回测足够，避开早期低流动性）
+symbol_overrides:
+  ETHUSDT:
+    timeframes: ["1h", "4h"]
+    history_start_date: "2024-01-01"
+  SOLUSDT:
+    timeframes: ["1h", "4h"]
+    history_start_date: "2024-01-01"
 
 # 数据存储根目录（相对项目根；Parquet 分区放在 data_dir/{symbol}/ 下）
 data_dir: "data/parquet"

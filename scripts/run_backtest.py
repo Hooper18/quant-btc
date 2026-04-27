@@ -215,6 +215,10 @@ def main() -> int:
     parser.add_argument("--backtest", default=str(PROJECT_ROOT / "config" / "backtest_config.yaml"))
     parser.add_argument("--data-config", default=str(PROJECT_ROOT / "config" / "data_config.yaml"))
     parser.add_argument(
+        "--symbol", default=None,
+        help="覆盖 data_config 默认 symbol（多币种新加币种常用，如 ETHUSDT）",
+    )
+    parser.add_argument(
         "--output-dir", default=None,
         help="可视化报告输出目录；默认 output/backtest_{YYYYmmdd_HHMMSS}/",
     )
@@ -225,6 +229,9 @@ def main() -> int:
     log = logging.getLogger("run_backtest")
 
     data_cfg = DataConfig.from_yaml(args.data_config)
+    if args.symbol:
+        data_cfg = data_cfg.for_symbol(args.symbol)
+        log.info("覆盖 symbol → %s（数据目录 %s）", data_cfg.symbol, data_cfg.symbol_dir)
     bt = Backtester.from_yaml(args.backtest)
 
     with open(args.strategy, "r", encoding="utf-8") as f:

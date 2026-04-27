@@ -1,8 +1,11 @@
 """一键下载入口：按 config/data_config.yaml 拉取全量 OHLCV + 衍生数据。
 
 用法：
-- 全量：`uv run python scripts/download_all.py`
+- 全量(BTC + 衍生)：`uv run python scripts/download_all.py`
 - 冒烟：`uv run python scripts/download_all.py --test`（只下 1d 2024-01..03 + 恐慌指数）
+- 多币种：`uv run python scripts/download_all.py --symbols BTCUSDT,ETHUSDT,SOLUSDT`
+- 仅一个币种：`uv run python scripts/download_all.py --symbol ETHUSDT`
+- 跳过衍生数据(funding/OI/FNG, 多币种新币常用)：加 `--no-aux`
 
 每个数据源独立 try/except 包裹：单源失败不影响其他源；OHLCV 内部按 timeframe 串行，
 单 timeframe 失败也只影响自己。结尾打印各源条数与时间范围摘要。
@@ -78,29 +81,47 @@ def _run_test(cfg: DataConfig, log: logging.Logger) -> int:
     return 0
 
 
-def _run_full(cfg: DataConfig, log: logging.Logger) -> int:
-    summary: list[str] = []
-
-    # 1. OHLCV 历史 + 当月增量
+def _run_ohlcv_for_symbol(cfg: DataConfig, log: logging.Logger, summary: list[str]) -> None:
+    """对单个 symbol 拉取所有 timeframe 的历史 + 当月增量。"""
     for tf in cfg.timeframes:
-        log.info("=== OHLCV %s ===", tf)
+        log.info("=== %s OHLCV %s ===", cfg.symbol, tf)
         try:
             hist = download_history(cfg, tf)
             log.info("历史：下载=%d 跳过=%d 失败=%d",
                      hist["downloaded"], hist["skipped"], hist["failed"])
         except Exception:
-            log.exception("OHLCV 历史 %s 整体失败", tf)
+            log.exception("OHLCV 历史 %s/%s 整体失败", cfg.symbol, tf)
             hist = {"downloaded": 0, "skipped": 0, "failed": -1}
         try:
             recent = fetch_recent(cfg, tf)
             log.info("REST 增量：appended=%d", recent.get("appended", 0))
         except Exception:
-            log.exception("OHLCV 增量 %s 失败", tf)
+            log.exception("OHLCV 增量 %s/%s 失败", cfg.symbol, tf)
             recent = {"appended": 0}
         summary.append(
-            f"OHLCV {tf}: 历史下载={hist['downloaded']} 跳过={hist['skipped']} "
+            f"{cfg.symbol} {tf}: 历史下载={hist['downloaded']} 跳过={hist['skipped']} "
             f"失败={hist['failed']} 增量={recent.get('appended', 0)}"
         )
+
+
+def _run_full(cfg: DataConfig, log: logging.Logger, *, symbols: list[str], with_aux: bool) -> int:
+    summary: list[str] = []
+
+    # 1. OHLCV：对每个 symbol 走自定义配置
+    for sym in symbols:
+        sym_cfg = cfg.for_symbol(sym)
+        log.info(
+            "######### %s timeframes=%s start=%s #########",
+            sym, sym_cfg.timeframes, sym_cfg.history_start_date,
+        )
+        _run_ohlcv_for_symbol(sym_cfg, log, summary)
+
+    if not with_aux:
+        _print_summary(summary, title="下载摘要(--no-aux)")
+        return 0
+
+    # 衍生数据只针对默认 symbol（BTCUSDT，多年覆盖最完整）
+    cfg = cfg.for_symbol(cfg.symbol)
 
     # 2. 资金费率（走 vision CDN，国内可访问）
     log.info("=== 资金费率(vision) ===")
@@ -148,6 +169,21 @@ def main() -> int:
         action="store_true",
         help="冒烟测试：只下 1d 2024-01..03 + 恐慌指数",
     )
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        help="只下单个 symbol（覆盖 config 的 symbols 列表）",
+    )
+    parser.add_argument(
+        "--symbols",
+        default=None,
+        help="覆盖 config.symbols；逗号分隔，如 ETHUSDT,SOLUSDT",
+    )
+    parser.add_argument(
+        "--no-aux",
+        action="store_true",
+        help="跳过资金费率/OI/FNG（多币种新加币种常用）",
+    )
     args = parser.parse_args()
 
     _setup_logging()
@@ -155,14 +191,23 @@ def main() -> int:
 
     cfg_path = PROJECT_ROOT / "config" / "data_config.yaml"
     cfg = DataConfig.from_yaml(cfg_path)
+
+    # 决定本次要下载的 symbols
+    if args.symbol:
+        symbols = [args.symbol]
+    elif args.symbols:
+        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols = cfg.symbols or [cfg.symbol]
+
     log.info(
-        "配置：symbol=%s timeframes=%s start=%s data_dir=%s",
-        cfg.symbol, cfg.timeframes, cfg.history_start_date, cfg.data_dir,
+        "配置：symbols=%s timeframes(默认)=%s start=%s data_dir=%s",
+        symbols, cfg.timeframes, cfg.history_start_date, cfg.data_dir,
     )
 
     if args.test:
         return _run_test(cfg, log)
-    return _run_full(cfg, log)
+    return _run_full(cfg, log, symbols=symbols, with_aux=not args.no_aux)
 
 
 if __name__ == "__main__":
