@@ -1,0 +1,14 @@
+# 策略组合配置：每个 sleeve 独立资金、独立币种、可指定不同策略
+# 用法：uv run python scripts/run_portfolio.py --config config/portfolio.yaml
+total_balance: 100   # USDT 总本金（按 allocation 分配到各 sleeve）
+
+portfolio:
+  - strategy: config/strategies_v2_optimized.yaml
+    symbol: BTCUSDT
+    allocation: 0.50
+  - strategy: config/strategies_v2_optimized.yaml
+    symbol: ETHUSDT
+    allocation: 0.25
+  - strategy: config/strategies_v2_optimized.yaml
+    symbol: SOLUSDT
+    allocation: 0.25
